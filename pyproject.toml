@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "puremind-mac"
+version = "0.1.0"
+description = "Local memory daemon for AI coding agents: a Markdown vault, hybrid retrieval, and a read-only MCP server."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "PureTensor, Inc." }]
+keywords = ["mcp", "memory", "agents", "markdown", "retrieval", "obsidian"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "numpy>=1.26",
+  "bm25s>=0.2.7",
+  "PyStemmer>=2.2",
+  "sentence-transformers>=3.0",
+  "mcp>=1.2",
+  "watchdog>=4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+puremind = "puremind_mac.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/puremind_mac"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
