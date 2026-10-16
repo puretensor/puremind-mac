@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 (2026-10-16)
+
+- Support the mcp 2.x SDK (server class renamed to MCPServer) alongside 1.x; dependency bound `mcp>=1.2,<3`.
+- Serialise SQLite access behind a re-entrant lock so tool handlers running on MCP worker threads and the file watcher share one connection safely.
+- Explicit stdio transport in `puremind serve`.
+- Tests pass on both SDK versions.
+
 ## 0.1.0
 
 Initial release.

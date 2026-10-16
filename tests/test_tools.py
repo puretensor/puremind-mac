@@ -15,6 +15,20 @@ def indexed(service, vault):
     return service
 
 
+def _result_text(result) -> str:
+    """call_tool returns a list of content blocks (mcp 1.x), a (blocks, structured)
+    tuple, or a CallToolResult with .content (mcp 2.x)."""
+    blocks = getattr(result, "content", None)
+    if blocks is None:
+        blocks = result[0] if isinstance(result, tuple) else result
+    return "".join(getattr(c, "text", "") for c in blocks)
+
+
+def _schema(tool):
+    """mcp 1.x exposes inputSchema, mcp 2.x input_schema."""
+    return getattr(tool, "inputSchema", None) or getattr(tool, "input_schema")
+
+
 def test_server_exposes_exactly_three_read_only_tools(service):
     names = {t.name for t in asyncio.run(build_server(service).list_tools())}
     assert names == {"puremind_search", "puremind_get", "puremind_recent"}
@@ -22,17 +36,17 @@ def test_server_exposes_exactly_three_read_only_tools(service):
 
 def test_tool_schemas_and_defaults(service):
     tools_ = {t.name: t for t in asyncio.run(build_server(service).list_tools())}
-    s = tools_["puremind_search"].inputSchema
+    s = _schema(tools_["puremind_search"])
     assert s["required"] == ["query"] and s["properties"]["limit"]["default"] == 10
-    r = tools_["puremind_recent"].inputSchema["properties"]
+    r = _schema(tools_["puremind_recent"])["properties"]
     assert r["days"]["default"] == 7 and r["limit"]["default"] == 20
-    assert tools_["puremind_get"].inputSchema["required"] == ["path"]
+    assert _schema(tools_["puremind_get"])["required"] == ["path"]
 
 
 def test_server_calls_through_to_handlers(service, vault):
     indexed(service, vault)
     result = asyncio.run(build_server(service).call_tool("puremind_search", {"query": "espresso grinder"}))
-    text = "".join(c.text for c in (result[0] if isinstance(result, tuple) else result))
+    text = _result_text(result)
     assert "projects/espresso.md" in text
 
 

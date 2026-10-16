@@ -94,7 +94,7 @@ def cmd_serve(args, cfg: Config) -> int:
     from .server import build_server
 
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
-    build_server(_service(cfg)).run()  # stdio transport
+    build_server(_service(cfg)).run(transport="stdio")
     return 0
 
 

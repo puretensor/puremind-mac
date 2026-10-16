@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp 2.x renamed FastMCP to MCPServer; the decorator and run() are unchanged
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP
 
 from . import tools
 from .service import Service

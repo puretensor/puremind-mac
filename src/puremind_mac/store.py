@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,12 +66,64 @@ class FileRow:
     title: str
 
 
+class _LockedConnection:
+    """sqlite3 connection shared across threads behind one re-entrant lock.
+
+    MCP servers run synchronous tool handlers on worker threads, and the file
+    watcher re-indexes from its own thread, so every statement and every
+    transaction block (``with store.db:``) is serialised here.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+        self._lock = threading.RLock()
+
+    def execute(self, *a, **k):
+        with self._lock:
+            return self._conn.execute(*a, **k)
+
+    def executemany(self, *a, **k):
+        with self._lock:
+            return self._conn.executemany(*a, **k)
+
+    def executescript(self, *a, **k):
+        with self._lock:
+            return self._conn.executescript(*a, **k)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            return self._conn.__exit__(*exc)
+        finally:
+            self._lock.release()
+
+    @property
+    def row_factory(self):
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._conn.row_factory = value
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=30)
+        self.db = _LockedConnection(sqlite3.connect(self.path, timeout=30, check_same_thread=False))
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
         if self.path != ":memory:":
