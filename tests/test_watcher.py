@@ -591,11 +591,14 @@ def test_quiet_work_runs_once_after_each_quiet_spell(tmp_path):
     runs, quiets = [], []
     stop, thread = _watch_in_thread(vault, lambda: runs.append(1), quiet=lambda: quiets.append(len(runs)), quiet_after=0.3)
     try:
-        assert wait_for(lambda: quiets == [1])  # after the first run
+        # FSEvents may report the vault's own creation after watching starts, which costs a second run.
+        assert wait_for(lambda: quiets and quiets[-1] == len(runs))  # after the last run
         time.sleep(0.8)
-        assert quiets == [1]  # once per quiet spell, not on every tick
+        assert len(set(quiets)) == len(quiets)  # once per quiet spell: never twice without a run between
+        before = len(quiets)
         (vault / "a.md").write_text("# a\n")
-        assert wait_for(lambda: quiets == [1, 2])
+        assert wait_for(lambda: len(quiets) > before and quiets[-1] == len(runs))
+        assert len(set(quiets)) == len(quiets) and quiets == sorted(quiets)
     finally:
         stop.set()
         thread.join(PATIENT)
