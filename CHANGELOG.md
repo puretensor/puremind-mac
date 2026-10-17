@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4 (unreleased)
+
+- A new embedding model, or a new `embedder_revision`, now needs `puremind index --rebuild`. `puremind index` without it stops with an error and changes nothing; 0.1.3 and earlier emptied the index and embedded every note again. A `puremind watch` still running on the old configuration, and a fresh `puremind index` on the new one, used to wipe each other's index in turn, with a full re-embed each time. Now the stale watch stops with an error and a hint to restart it, and the index stays as it is. An index that holds no notes takes a new model without `--rebuild`.
+
 ## 0.1.3 (2026-10-17)
 
 Fixes from a second review of 0.1.2. Upgrading from 0.1.2 embeds nothing again. The `v0.1.2` tag was made before these fixes, so an install from `main` between the two releases reports 0.1.2 but already has them.

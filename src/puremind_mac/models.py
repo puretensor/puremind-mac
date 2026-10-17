@@ -39,7 +39,9 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 log = logging.getLogger("puremind.models")
 
-# Revision used when none is configured for a default model.
+# Revision used when none is configured for a default model. A new embedder revision here makes
+# `index` and `watch` refuse every existing index until `puremind index --rebuild`, so a release
+# that changes it must say so.
 PINNED_REVISIONS = {DEFAULT_EMBEDDER: DEFAULT_EMBEDDER_REVISION, DEFAULT_RERANKER: DEFAULT_RERANKER_REVISION}
 # What the loaders read: configuration, tokenizer files and safetensors weights (never pickle files).
 # A download stays at the weights the models need even when a repository also ships other formats.

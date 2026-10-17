@@ -473,6 +473,46 @@ def test_puremind_watch_stops_when_a_symlinked_vault_names_another_directory(tmp
     assert "error: this index belongs to" in capsys.readouterr().err
 
 
+def test_a_stale_puremind_watch_stops_instead_of_wiping_an_index_rebuilt_for_another_model(
+    vault, tmp_path, monkeypatch, capsys
+):
+    import numpy as np
+
+    from puremind_mac import cli
+    from puremind_mac.indexer import index_vault
+    from puremind_mac.store import Store
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("PUREMIND_HOME", str(home))
+    monkeypatch.delenv("PUREMIND_DB", raising=False)
+
+    def stub(name):
+        return SimpleNamespace(name=name, embed_documents=lambda texts: np.ones((len(texts), 4), dtype="float32"))
+
+    monkeypatch.setattr("puremind_mac.service.SentenceTransformerEmbedder", lambda *a, **k: stub("old-model"))
+
+    def two_runs(vault, run_index, delay, stop):
+        run_index()
+        store = Store(home / "index.sqlite")
+        try:  # `puremind index --rebuild` with the new config, while this watch still has the old one
+            index_vault(vault, store, stub("new-model"), rebuild=True)
+        finally:
+            store.close()
+        run_index()
+        assert stop.is_set()
+
+    monkeypatch.setattr("puremind_mac.watcher.watch", two_runs)
+    assert cli.main(["watch", str(vault)]) == 2
+    err = capsys.readouterr().err
+    assert "error: the index was built with new-model but old-model is configured; nothing was changed" in err
+    assert "hint: `puremind watch` keeps the model it started with: restart it if the model has changed" in err
+    store = Store(home / "index.sqlite")
+    try:
+        assert store.get_meta("embedder") == "new-model" and store.stats()["files"] == 3
+    finally:
+        store.close()
+
+
 def test_puremind_watch_names_a_missing_vault(tmp_path, monkeypatch, capsys):
     from puremind_mac import cli
 

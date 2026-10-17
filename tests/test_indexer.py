@@ -16,6 +16,7 @@ from puremind_mac.indexer import (
     EMBED_BATCH,
     MAX_PATH_CHARS,
     EmbedderError,
+    ModelMismatch,
     discover,
     index_vault,
     title_of,
@@ -123,11 +124,26 @@ def test_notes_cut_by_an_earlier_chunker_are_cut_again_once(vault, store, embedd
     assert index_vault(vault, store, embedder).unchanged == 3
 
 
-def test_changing_the_embedder_triggers_a_rebuild(vault, store, embedder):
+def test_a_new_embedder_is_refused_without_rebuild(vault, store, embedder):
     index_vault(vault, store, embedder)
-    embedder.name = "another-model"
-    stats = index_vault(vault, store, embedder)
+    before, calls = store.stats(), embedder.doc_calls
+    embedder.name = "another-model"  # a `watch` on the old config and a fresh `index` must not wipe each other
+    with pytest.raises(ModelMismatch, match="built with fake-embedder but another-model is configured; nothing was"):
+        index_vault(vault, store, embedder)
+    assert store.stats() == before and store.get_meta("embedder") == "fake-embedder"
+    assert embedder.doc_calls == calls  # refused before anything is embedded, the probe included
+    stats = index_vault(vault, store, embedder, rebuild=True)
     assert stats.added == 3
+    assert store.get_meta("embedder") == "another-model"
+
+
+def test_an_index_with_no_notes_takes_a_new_embedder_without_rebuild(tmp_path, store, embedder):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    index_vault(empty, store, embedder)  # records the model, holds nothing that could be lost
+    (empty / "a.md").write_text("# A\n\nhello\n")
+    embedder.name = "another-model"
+    assert index_vault(empty, store, embedder).added == 1
     assert store.get_meta("embedder") == "another-model"
 
 
@@ -515,7 +531,10 @@ def test_a_new_embedder_revision_embeds_every_note_again(vault, store, embedder)
     index_vault(vault, store, embedder)
     assert index_vault(vault, store, embedder).unchanged == 3 and store.get_meta("embedder_revision") == "rev-a"
     embedder.revision = "rev-b"  # vectors of two revisions cannot be searched together
-    stats = index_vault(vault, store, embedder)
+    with pytest.raises(ModelMismatch, match="at revision rev-a but fake-embedder at revision rev-b"):
+        index_vault(vault, store, embedder)
+    assert store.get_meta("embedder_revision") == "rev-a" and store.stats()["files"] == 3
+    stats = index_vault(vault, store, embedder, rebuild=True)
     assert stats.added == 3 and stats.unchanged == 0 and store.get_meta("embedder_revision") == "rev-b"
 
 
@@ -571,8 +590,10 @@ def test_a_model_that_cannot_run_does_not_destroy_the_index(vault, store, embedd
     index_vault(vault, store, embedder)
     before = store.stats()
     typo = _Wrapped(embedder, _boom, name="Qwen/Qwen3-Embeding-0.6B")  # a mistyped model name
-    with pytest.raises(EmbedderError, match="could not load the model"):
+    with pytest.raises(ModelMismatch):
         index_vault(vault, store, typo)
+    with pytest.raises(EmbedderError, match="could not load the model"):
+        index_vault(vault, store, typo, rebuild=True)
     assert store.stats() == before and store.get_meta("embedder") == "fake-embedder"
     with pytest.raises(EmbedderError):
         index_vault(vault, store, _Wrapped(embedder, _boom), rebuild=True)
@@ -751,7 +772,7 @@ def test_a_rebuild_leaves_nothing_of_the_old_index_in_the_files(vault, private_i
     (vault / "secret.md").unlink()
     if how == "new model":
         embedder.name = "another-model"
-    stats = index_vault(vault, private_index, embedder, rebuild=how == "rebuild")
+    stats = index_vault(vault, private_index, embedder, rebuild=True)
     assert stats.added + stats.updated == 3
     assert _copies(home, b"zqxcanary7f3a9") == 0
 

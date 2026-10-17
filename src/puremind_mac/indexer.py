@@ -22,7 +22,7 @@ from .chunker import (
     frontmatter_end,
 )
 from .chunker import VERSION as CHUNKER_VERSION
-from .models import Embedder, ModelLoadError, embedder_revision, model_key
+from .models import Embedder, ModelLoadError, embedder_revision, model_key, model_label
 from .store import Store, StoreError
 
 log = logging.getLogger("puremind.index")
@@ -43,6 +43,11 @@ class EmbedderError(RuntimeError):
 
 class VaultMismatch(ValueError):
     """The index belongs to another vault directory. Nothing was changed."""
+
+
+class ModelMismatch(ValueError):
+    """The index was built with another embedding model or revision, and no rebuild was asked for.
+    Nothing was changed."""
 
 
 @dataclass
@@ -419,10 +424,11 @@ def index_vault(
     """Bring the index in line with the vault.
 
     ``rebuild`` embeds every note again, replacing each one's rows in turn, so searches keep
-    finding the old version meanwhile. A new embedding model, or a new revision of it, discards
-    the index first, since vectors from two models cannot be searched together. Notes cut by an
-    earlier chunker are cut and embedded again. ``should_stop`` is polled between notes; once it
-    returns True the run ends early without removing anything.
+    finding the old version meanwhile. A new embedding model, or a new revision of it, is refused
+    with ``ModelMismatch`` unless ``rebuild`` is set, and then discards the index first, since
+    vectors from two models cannot be searched together. Notes cut by an earlier chunker are cut
+    and embedded again. ``should_stop`` is polled between notes; once it returns True the run
+    ends early without removing anything.
     """
     vault = vault.expanduser().resolve()
     if not vault.is_dir():
@@ -441,9 +447,13 @@ def index_vault(
     changed = known_model is not None and (
         model_key(known_model) != model_key(embedder.name) or (known_rev is not None and known_rev != revision)
     )
+    if changed and store.stats()["files"]:
+        if not rebuild:  # else a `watch` left on the old config and a fresh `index` wipe each other in turn
+            built = model_label(known_model) + (f" at revision {known_rev}" if known_rev else "")
+            wanted = model_label(embedder.name) + (f" at revision {revision}" if revision else "")
+            raise ModelMismatch(f"the index was built with {built} but {wanted} is configured; nothing was changed")
+        _embed(embedder, [PROBE_TEXT])  # a model that cannot run must not cost the user an index
     if changed:
-        if store.stats()["files"]:
-            _embed(embedder, [PROBE_TEXT])  # a model that cannot run must not cost the user an index
         log.warning(
             "embedder changed (%s%s -> %s%s); rebuilding the index",
             known_model, f" at {known_rev}" if known_rev else "", embedder.name, f" at {revision}" if revision else "",
