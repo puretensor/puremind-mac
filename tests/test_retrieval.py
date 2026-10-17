@@ -9,11 +9,14 @@ import pytest
 import Stemmer
 from fakes import FakeEmbedder, FakeReranker
 
+from puremind_mac import retrieval
 from puremind_mac.retrieval import (
     _CJK,
     _CJK_RANGES,
     HybridIndex,
+    LexiconBuilder,
     _segment_cjk,
+    _words,
     rrf_fuse,
 )
 
@@ -311,4 +314,114 @@ def test_english_lexical_ranking_is_unchanged():
     idx, _ = make_index()
     for q in ("espresso grinder", "tomato garden compost", "the build pipeline", "boiler"):
         res, scores = legacy.retrieve(legacy_tokenize([q]), k=len(DOCS), show_progress=False)
-        assert idx.lexical(q, len(DOCS)) == [int(j) for j, s in zip(res[0], scores[0]) if s > 0]
+        ranked = sorted(zip(scores[0].tolist(), res[0].tolist()), key=lambda t: (-t[0], t[1]))  # ties by position
+        assert idx.lexical(q, len(DOCS)) == [j for s, j in ranked if s > 0]
+
+
+# ---- the BM25 index scores as bm25s does, and is rebuilt from what changed
+
+WORDS = [
+    "the", "a", "of", "and", "espresso", "grinder", "boiler", "tomatoes", "garden", "compost", "pipeline",
+    "containers", "backflush", "weekly", "raised", "beds", "descale", "months", "beans", "burr", "setting",
+    "migrate", "hermetic", "build", "kubernetes", "cluster", "deploy",
+    *(f"term{i}" for i in range(60)), "数据库", "服务器", "猫", "서울", "サーバー",
+]
+
+
+def random_texts(rng, n):
+    texts = []
+    for _ in range(n):
+        size = rng.choice([0, 1, 3, 12, 40, 120])
+        texts.append(" ".join(rng.choice(WORDS) for _ in range(size)))
+    return texts
+
+
+def query_words(query):
+    return _words(retrieval.tokenize([query], query=True))[0]
+
+
+QUERIES = ["espresso", "espresso espresso grinder", "the of", "term3 term3 term7 boiler", "unknownword", "猫 服务器",
+           "tomatoes garden compost raised beds pipeline", ""]
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_lexicon_scores_match_bm25s(seed):
+    rng = random.Random(seed)
+    texts = random_texts(rng, 200) + ["espresso grinder"]  # at least one token
+    reference = bm25s.BM25()
+    reference.index(retrieval.tokenize(texts), show_progress=False)
+    lexicon = LexiconBuilder().build(texts)
+    for query in QUERIES:
+        words = query_words(query)
+        ours = lexicon.scores(words)
+        theirs = reference.get_scores(words) if words else np.zeros(len(texts))
+        assert np.allclose(ours, theirs, rtol=1e-5, atol=1e-6), query
+
+
+def test_a_lexicon_built_from_the_previous_one_scores_like_a_fresh_build():
+    rng = random.Random(7)
+    builder = LexiconBuilder()
+    before = random_texts(rng, 150)
+    builder.build(before)
+    after = before[20:] + random_texts(rng, 30)  # some chunks gone, some new
+    after[5] += " espresso"  # one edited
+    built, fresh = builder.build(after), LexiconBuilder().build(after)
+    for query in QUERIES:
+        words = query_words(query)
+        assert np.allclose(built.scores(words), fresh.scores(words), rtol=1e-12, atol=0)
+        assert built.top(words, 20) == fresh.top(words, 20)
+
+
+def test_the_builder_tokenizes_only_text_it_has_not_seen():
+    seen = []
+
+    def counting(docs, query=False):
+        seen.append(list(docs))
+        return retrieval.tokenize(docs, query)
+
+    builder = LexiconBuilder()
+    builder.build(["alpha one", "beta two", "alpha one"], counting)
+    assert seen == [["alpha one", "beta two"]]  # a repeated text is tokenized once
+    builder.build(["alpha one", "beta two", "gamma three"], counting)
+    assert seen[-1] == ["gamma three"]
+    builder.build(["gamma three", "alpha one"], counting)
+    assert len(seen) == 2  # nothing new
+
+
+def test_the_builder_keeps_nothing_of_text_that_left_the_index():
+    builder = LexiconBuilder()
+    builder.build(["the code is zqxcanary", "garden plan"])
+    lexicon = builder.build(["garden plan"])
+    assert len(builder._docs) == 1
+    assert lexicon.top(query_words("zqxcanary"), 5) == []
+
+
+def test_unused_words_are_dropped_and_an_older_lexicon_keeps_working():
+    builder = LexiconBuilder()
+    first = None
+    for round_ in range(4):  # every round replaces the whole vault with 3,000 words not seen before
+        texts = [" ".join(f"w{round_}x{i}y{j}" for j in range(10)) for i in range(300)]
+        lexicon = builder.build(texts)
+        assert lexicon.top(query_words(texts[3]), 1) == [3]
+        assert len(builder._vocab) <= 6000  # words of earlier rounds do not pile up
+        if first is None:
+            first, first_texts = lexicon, texts
+    assert first.top(query_words(first_texts[7]), 1) == [7]  # a search still holding the first snapshot
+
+
+def test_a_failed_build_leaves_the_builder_as_it_was():
+    builder = LexiconBuilder()
+    builder.build(["alpha beta"])
+
+    def failing(docs, query=False):
+        raise MemoryError("simulated")
+
+    with pytest.raises(MemoryError):
+        builder.build(["alpha beta", "gamma delta"], failing)
+    lexicon = builder.build(["alpha beta", "gamma delta"])
+    assert lexicon.top(query_words("gamma"), 5) == [1] and lexicon.top(query_words("alpha"), 5) == [0]
+
+
+def test_ties_are_ordered_by_position():
+    lexicon = LexiconBuilder().build(["espresso machine", "espresso boiler", "espresso cups", "garden"])
+    assert lexicon.top(query_words("espresso"), 3) == [0, 1, 2]

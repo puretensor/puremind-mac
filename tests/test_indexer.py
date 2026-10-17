@@ -793,3 +793,16 @@ def test_a_reader_holding_the_log_gets_a_warning_instead_of_a_stall(vault, priva
     assert stats.removed == 1 and took < 10  # the checkpoint does not wait out the 30 s lock timeout
     assert any("until the next run" in r.getMessage() for r in caplog.records)
     assert private_index.checkpoint()  # with the reader gone, the log is emptied
+
+
+def test_a_run_can_leave_the_keyword_index_compaction_to_the_next_purging_run(vault, private_index, embedder):
+    home = Path(private_index.path).parent
+    (vault / "secret.md").write_text("# Secret\n\nthe code is zqxcanary7f3a9\n")
+    index_vault(vault, private_index, embedder)
+    (vault / "secret.md").unlink()
+    stats = index_vault(vault, private_index, embedder, purge=False)
+    assert stats.removed == 1 and stats.purge_deferred and private_index.purge_pending()
+    assert not any("zqxcanary7f3a9" in c.content for c in private_index.load_index()[0])  # the text itself is gone
+    stats = index_vault(vault, private_index, embedder)  # nothing changed, but the compaction is owed
+    assert (stats.removed, stats.updated, stats.purge_deferred) == (0, 0, False)
+    assert not private_index.purge_pending() and _copies(home, b"zqxcanary7f3a9") == 0

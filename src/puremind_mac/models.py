@@ -17,7 +17,8 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -38,6 +39,10 @@ if TYPE_CHECKING:
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 log = logging.getLogger("puremind.models")
+
+# How long a model that failed to load is not tried again: each try can wait seconds for the Hub
+# or read gigabytes of weights, and searches that overlap would otherwise each try in turn.
+LOAD_RETRY_AFTER = 60.0
 
 # Revision used when none is configured for a default model. A new embedder revision here makes
 # `index` and `watch` refuse every existing index until `puremind index --rebuild`, so a release
@@ -272,6 +277,35 @@ def resolve_model(name: str, revision: str | None = None, *, namespace: str | No
     return os.path.abspath(path)
 
 
+class _LoadOnce:
+    """Loads a model on first use, one thread at a time, and remembers a failure for a while.
+
+    Within LOAD_RETRY_AFTER seconds of a failed load, every caller gets the same error at once,
+    with the same cause, instead of trying again. The memory is per instance, so a new process
+    always tries.
+    """
+
+    def __init__(self, load: Callable[[], object]):
+        self._load = load
+        self._model = None
+        self._failed: tuple[float, ModelLoadError] | None = None
+        self._lock = threading.Lock()
+
+    def get(self):
+        with self._lock:
+            if self._model is None:
+                if self._failed is not None and time.monotonic() - self._failed[0] < LOAD_RETRY_AFTER:
+                    error = self._failed[1]
+                    raise ModelLoadError(str(error)) from error.__cause__
+                try:
+                    self._model = self._load()
+                except ModelLoadError as exc:
+                    self._failed = (time.monotonic(), exc)
+                    raise
+                self._failed = None
+        return self._model
+
+
 def _normalise(v: np.ndarray) -> np.ndarray:
     import numpy as np
 
@@ -311,28 +345,25 @@ class SentenceTransformerEmbedder:
         self._revision = revision
         # What resolve_model loads: the pinned commit of a default model when none is given.
         self.revision = None if is_local_path(model) else revision or PINNED_REVISIONS.get(model)
-        self._model = None
-        self._lock = threading.Lock()
+        self._model = _LoadOnce(self._open)
         # Searches overlap on MCP worker threads, but one model must not run two calls at once: its
         # fast tokenizer raises "Already borrowed" when two threads use it, and devices such as mps
         # are not safe for concurrent forward passes on one model.
         self._busy = threading.Lock()
 
-    def _load(self):
-        with self._lock:
-            if self._model is None:
-                path = resolve_model(self.name, self._revision, namespace="sentence-transformers")
-                try:
-                    from sentence_transformers import SentenceTransformer
+    def _open(self):
+        path = resolve_model(self.name, self._revision, namespace="sentence-transformers")
+        try:
+            from sentence_transformers import SentenceTransformer
 
-                    m = SentenceTransformer(
-                        path, device=pick_device(self._device), trust_remote_code=False, local_files_only=True
-                    )
-                    m.max_seq_length = self._max_seq
-                except Exception as exc:
-                    raise ModelLoadError(f"could not load model {model_label(self.name)} ({type(exc).__name__})") from exc
-                self._model = m
-        return self._model
+            m = SentenceTransformer(path, device=pick_device(self._device), trust_remote_code=False, local_files_only=True)
+            m.max_seq_length = self._max_seq
+        except Exception as exc:
+            raise ModelLoadError(f"could not load model {model_label(self.name)} ({type(exc).__name__})") from exc
+        return m
+
+    def _load(self):
+        return self._model.get()
 
     def embed_documents(self, texts: Sequence[str]) -> np.ndarray:
         import numpy as np
@@ -375,25 +406,23 @@ class CrossEncoderReranker:
         self._device = device
         self._query_chars = query_chars
         self._revision = revision
-        self._model = None
-        self._lock = threading.Lock()
+        self._model = _LoadOnce(self._open)
         self._busy = threading.Lock()  # one call at a time, as for the embedder
 
-    def _load(self):
-        with self._lock:
-            if self._model is None:
-                path = resolve_model(self.name, self._revision)
-                try:
-                    from sentence_transformers import CrossEncoder
+    def _open(self):
+        path = resolve_model(self.name, self._revision)
+        try:
+            from sentence_transformers import CrossEncoder
 
-                    m = CrossEncoder(
-                        path, max_length=512, device=pick_device(self._device),
-                        trust_remote_code=False, local_files_only=True,
-                    )
-                except Exception as exc:
-                    raise ModelLoadError(f"could not load model {model_label(self.name)} ({type(exc).__name__})") from exc
-                self._model = m
-        return self._model
+            m = CrossEncoder(
+                path, max_length=512, device=pick_device(self._device), trust_remote_code=False, local_files_only=True
+            )
+        except Exception as exc:
+            raise ModelLoadError(f"could not load model {model_label(self.name)} ({type(exc).__name__})") from exc
+        return m
+
+    def _load(self):
+        return self._model.get()
 
     def score(self, query: str, passages: Sequence[str]) -> list[float]:
         import numpy as np

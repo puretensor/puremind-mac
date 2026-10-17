@@ -8,6 +8,8 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+import time
 import types
 import urllib.request
 from pathlib import Path
@@ -615,3 +617,55 @@ def test_real_models_rank_the_relevant_passage_first(monkeypatch):
     reranker = CrossEncoderReranker(DEFAULT_RERANKER, os.environ.get("PUREMIND_DEVICE", "cpu"))
     good, bad = reranker.score("how often do I descale the espresso machine", ["Descale the boiler every three months.", "Plant tomatoes in May."])
     assert 0.0 <= bad < good <= 1.0
+
+
+# ---- a model that failed to load is not tried again at once
+
+
+@pytest.mark.parametrize("make", [SentenceTransformerEmbedder, CrossEncoderReranker])
+def test_a_failed_load_is_remembered_and_tried_again_later(stubs, monkeypatch, make):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")  # not cached and offline: every try fails
+    model = make(DEFAULT_EMBEDDER if make is SentenceTransformerEmbedder else DEFAULT_RERANKER)
+    use = (lambda: model.embed_query("q")) if make is SentenceTransformerEmbedder else (lambda: model.score("q", ["p"]))
+    errors = []
+    for _ in range(3):
+        with pytest.raises(ModelLoadError) as excinfo:
+            use()
+        errors.append(excinfo.value)
+    assert len(stubs.calls) == 1  # one look at the cache, not three
+    assert len({str(e) for e in errors}) == 1 and "not downloaded yet" in str(errors[0])
+    assert all(type(e.__cause__) is type(errors[0].__cause__) for e in errors)  # the cause line stays the same
+    monkeypatch.setattr(models, "LOAD_RETRY_AFTER", 0.0)
+    with pytest.raises(ModelLoadError):
+        use()
+    assert len(stubs.calls) == 2  # after the cool-down it tries again
+    monkeypatch.delenv("HF_HUB_OFFLINE")
+    stubs.cached.add((DEFAULT_EMBEDDER, DEFAULT_EMBEDDER_REVISION))
+    stubs.cached.add((DEFAULT_RERANKER, DEFAULT_RERANKER_REVISION))
+    use()  # and once the model is there, it loads
+
+
+def test_overlapping_calls_during_a_failing_load_try_it_once():
+    calls = []
+
+    def load():
+        calls.append(1)
+        time.sleep(0.2)
+        raise ModelLoadError("could not load model x") from OSError("disk")
+
+    once = models._LoadOnce(load)
+    errors = []
+
+    def call():
+        try:
+            once.get()
+        except ModelLoadError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=call) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20)
+    assert len(calls) == 1 and len(errors) == 8
+    assert all(isinstance(e.__cause__, OSError) for e in errors)

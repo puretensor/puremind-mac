@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 (unreleased)
+
+Faster with large vaults. Measured on Linux with a synthetic vault of 50,000 chunks (20,000 in brackets), against 0.1.4:
+
+- After a note changes, a running `puremind serve` reloads the index on its next search in 0.8 s (0.3 s), down from 7.5 s (2.9 s). The keyword index is no longer built again from all the text: only chunks the previous snapshot did not hold are tokenized, and the BM25 scores are computed when a search asks for them. This also applies to every search during `puremind index --rebuild`, which changes the index note by note. Scores are the same as before; chunks with exactly equal scores are now listed in index order, and a keyword search costs 15 to 30 ms instead of a few. The first search of a new server process takes about the same time as before.
+- `puremind watch` no longer compacts the keyword index after every save, which took 0.5 s (0.2 s) and rewrote the whole keyword index each time. It now compacts once the vault has been quiet for a minute, at the latest five minutes after the change, and when it stops. The text of deleted and edited notes still leaves the index file at the end of the run that notices it; only their words stay in the keyword index until the compaction. A watch that crashes leaves a note in the index, so the next `puremind index` or `puremind watch` compacts. `puremind index` compacts at the end of every run, as before.
+- A model that fails to load is not tried again for a minute. Every search used to try again, which could mean waiting for the Hugging Face Hub or reading the weights each time, and searches that overlapped tried one after another. They now get the same error at once.
+
 ## 0.1.4 (2026-10-17)
 
 - A new embedding model, or a new `embedder_revision`, now needs `puremind index --rebuild`. `puremind index` without it stops with an error and changes nothing; 0.1.3 and earlier emptied the index and embedded every note again. A `puremind watch` still running on the old configuration, and a fresh `puremind index` on the new one, used to wipe each other's index in turn, with a full re-embed each time. Now the stale watch stops with an error and a hint to restart it, and the index stays as it is. An index that holds no notes takes a new model without `--rebuild`.

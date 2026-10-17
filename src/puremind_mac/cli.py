@@ -18,6 +18,7 @@ import signal
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -114,6 +115,13 @@ def cmd_index(args, cfg: Config) -> int:
     return 0
 
 
+# Under `puremind watch` the keyword index is compacted (Store.purge: about half a second at 50,000
+# chunks) once the vault has been quiet this long after a run, not after every save...
+PURGE_WHEN_QUIET = 60.0
+# ...but at the latest this long after the first run that left words of removed text in it.
+PURGE_AT_LEAST_EVERY = 300.0
+
+
 def cmd_watch(args, cfg: Config) -> int:
     from .indexer import ModelMismatch, VaultMismatch, index_vault
     from .watcher import watch
@@ -122,25 +130,46 @@ def cmd_watch(args, cfg: Config) -> int:
     svc = _service(dataclasses.replace(cfg, vault=vault))
     stop = threading.Event()
     refused: list[ValueError] = []
+    owed_since: list[float | None] = [None]  # when a run first left the keyword index to compact
+    first = [True]
 
     def run() -> None:  # always called on this thread, one run at a time
+        # The first run compacts, and so pays what a watch that crashed left owing.
+        now = time.monotonic()
+        purge = first[0] or (owed_since[0] is not None and now - owed_since[0] >= PURGE_AT_LEAST_EVERY)
+        first[0] = False
         try:
-            stats = index_vault(vault, svc.store, svc.embedder)
+            stats = index_vault(vault, svc.store, svc.embedder, purge=purge)
         except (VaultMismatch, ModelMismatch) as exc:
             # A symlinked vault that now names another directory, or an index rebuilt for another
             # model since this watch read its config: every later run would fail the same way.
             refused.append(exc)
             stop.set()
             return
+        if purge:
+            owed_since[0] = None
+        elif stats.purge_deferred and owed_since[0] is None:
+            owed_since[0] = now
         print(stats.summary(), flush=True)
         for item in stats.skipped:
             print(f"  skipped: {_one_line(item)}", file=sys.stderr, flush=True)
 
+    def compact() -> None:
+        if svc.store.purge_pending():
+            svc.store.purge()
+        owed_since[0] = None
+
     print(f"watching {_one_line(str(vault.resolve()))} (Ctrl-C to stop)", flush=True)
     try:
-        watch(vault, run, delay=args.debounce, stop=stop)
+        watch(vault, run, delay=args.debounce, stop=stop, quiet=compact, quiet_after=PURGE_WHEN_QUIET)
     finally:
-        svc.store.close()
+        try:
+            compact()  # skipped by a crash or power cut: the record in the index carries it to the next run
+        except Exception as exc:  # noqa: BLE001 - must not hide why watching ended
+            print(f"warning: the keyword index was not compacted ({_one_line(exc)}); the next run does it",
+                  file=sys.stderr)
+        finally:
+            svc.store.close()
     if refused:
         if isinstance(refused[0], ModelMismatch):
             return _fail(
