@@ -360,6 +360,7 @@ def test_offline_mode_never_downloads(stubs, monkeypatch, switch, value, tmp_pat
         models.resolve_model(DEFAULT_EMBEDDER)
     message = str(excinfo.value)
     assert "not downloaded yet" in message and "offline" in message and "run the command again" in message
+    assert f"({switch}) is on" in message  # the variable to unset is the one that is set
     assert "\n" not in message and str(tmp_path) not in message
     assert [c.get("local_files_only") for c in stubs.calls] == [True]
 
@@ -462,6 +463,35 @@ def test_an_incomplete_cached_snapshot_is_completed_online_and_used_as_it_is_off
     assert models.resolve_model(DEFAULT_EMBEDDER) == stubs.snapshot_path(DEFAULT_EMBEDDER, DEFAULT_EMBEDDER_REVISION)
 
 
+def test_an_incomplete_cached_snapshot_is_used_as_it_is_when_completing_it_fails(stubs, monkeypatch, tmp_path):
+    partial = str(tmp_path / "partial")
+
+    def download(repo, **kwargs):
+        if kwargs.get("local_files_only"):
+            raise IncompleteCache(partial)
+        raise ConnectionError("proxy down")
+
+    fill(partial)  # the loaders have what they need
+    monkeypatch.setattr(sys.modules["huggingface_hub"], "snapshot_download", download)
+    assert models.resolve_model(DEFAULT_EMBEDDER) == partial
+
+
+def test_a_missing_local_model_directory_is_not_named_by_its_full_path(tmp_path):
+    missing = tmp_path / "models" / "qwen"
+    with pytest.raises(ModelLoadError) as excinfo:
+        models.resolve_model(str(missing))
+    assert str(excinfo.value) == "model directory not found: qwen (a local directory)"
+    assert str(tmp_path) not in str(excinfo.value) and str(missing) in str(excinfo.value.__cause__)  # the CLI prints it
+
+
+def test_the_embedder_reports_the_revision_it_loads(tmp_path):
+    assert SentenceTransformerEmbedder(DEFAULT_EMBEDDER).revision == DEFAULT_EMBEDDER_REVISION
+    assert SentenceTransformerEmbedder(DEFAULT_EMBEDDER, revision="abc").revision == "abc"
+    assert SentenceTransformerEmbedder("org/other").revision is None
+    assert SentenceTransformerEmbedder(str(tmp_path), revision="abc").revision is None  # a directory has no revision
+    assert models.embedder_revision(SentenceTransformerEmbedder("org/other")) == ""
+
+
 def test_offline_switch_set_to_zero_does_not_block_the_download(stubs, monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     models.resolve_model(DEFAULT_EMBEDDER)
@@ -512,6 +542,7 @@ def test_the_reachability_check(stubs, monkeypatch):
     monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{port}")
     assert "127.0.0.1" in check(1.0)
     monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy.invalid:3128"})
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)  # whatever NO_PROXY says here
     assert check(1.0) is None  # a proxy is in the way: the client is left to try
     monkeypatch.setattr(socket, "create_connection", lambda *a, **k: pytest.fail("no direct connection expected"))
     assert check(1.0) is None

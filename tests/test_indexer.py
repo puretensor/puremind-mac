@@ -494,6 +494,45 @@ def test_a_directory_that_cannot_be_listed_keeps_its_notes(vault, store, embedde
     assert index_vault(vault, store, embedder).removed == 1  # a clean scan removes again
 
 
+def test_a_directory_that_cannot_be_listed_does_not_keep_deleted_notes_elsewhere(vault, store, embedder, monkeypatch):
+    index_vault(vault, store, embedder)
+    (vault / "journal" / "2026-10-01.md").unlink()
+    _unlistable(monkeypatch, "projects")  # a lost+found or a protected folder that is always there
+    stats = index_vault(vault, store, embedder)
+    assert stats.removed == 1 and sorted(store.file_hashes()) == ["projects/espresso.md", "projects/garden.md"]
+    assert "removal skipped: 1 directory could not be read" in stats.summary()
+
+
+def test_a_vault_that_cannot_be_listed_keeps_every_note(vault, store, embedder, monkeypatch):
+    index_vault(vault, store, embedder)
+    _unlistable(monkeypatch, vault.name)
+    stats = index_vault(vault, store, embedder)
+    assert stats.removed == 0 and store.stats()["files"] == 3
+
+
+def test_a_new_embedder_revision_embeds_every_note_again(vault, store, embedder):
+    embedder.revision = "rev-a"
+    index_vault(vault, store, embedder)
+    assert index_vault(vault, store, embedder).unchanged == 3 and store.get_meta("embedder_revision") == "rev-a"
+    embedder.revision = "rev-b"  # vectors of two revisions cannot be searched together
+    stats = index_vault(vault, store, embedder)
+    assert stats.added == 3 and stats.unchanged == 0 and store.get_meta("embedder_revision") == "rev-b"
+
+
+def test_an_index_without_a_recorded_revision_is_kept(vault, store, embedder):
+    index_vault(vault, store, embedder)
+    with store.db:
+        store.db.execute("DELETE FROM meta WHERE key = 'embedder_revision'")  # as 0.1.1 left it
+    embedder.revision = "rev-a"
+    assert index_vault(vault, store, embedder).unchanged == 3
+
+
+def test_a_local_model_path_spelled_with_a_tilde_matches_its_absolute_form(vault, store, embedder):
+    index_vault(vault, store, _Wrapped(embedder, name="~/models/embedder"))
+    stats = index_vault(vault, store, _Wrapped(embedder, name=os.path.expanduser("~/models/embedder")))
+    assert stats.unchanged == stats.scanned == 3  # the same model: nothing is cleared or embedded again
+
+
 @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads everything")
 def test_a_real_unreadable_directory_keeps_its_notes(vault, store, embedder):
     index_vault(vault, store, embedder)

@@ -687,3 +687,14 @@ def test_clear_drops_pages_an_earlier_version_freed_without_zeroing(tmp_path):
     with Store(db) as store:
         store.clear()
         assert _occurrences(d, b"zqxcanary7f3a9") == 0
+
+
+def test_an_old_index_whose_column_another_process_just_added_still_opens(tmp_path, monkeypatch):
+    from puremind_mac import store as store_module
+
+    path = tmp_path / "old.sqlite"
+    Store(path).close()
+    checks = iter([False])  # the first check misses the column, as when another process adds it meanwhile
+    real = store_module._has_chunker_column
+    monkeypatch.setattr(store_module, "_has_chunker_column", lambda conn: next(checks, None) or real(conn))
+    Store(path).close()

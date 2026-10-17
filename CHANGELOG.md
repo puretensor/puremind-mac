@@ -16,17 +16,17 @@ Fixes from a full review of 0.1.1. The first `puremind index` or `watch` run aft
 - Runs happen one at a time on the main thread, and a change during a run schedules exactly one more. A note edited while it was being embedded is read again before it is stored, so an older version can no longer overwrite a newer one.
 - Ctrl-C exits with status 130 and no traceback, without leaving the index half-written.
 - The watcher follows a vault directory that is replaced (a remount, or a sync tool swapping the folder), made again under the same inode number (ext4 does this), or unreadable for a while, and scans anyway after 10 quiet minutes. A vault that disappears again while it is being watched no longer ends `puremind watch`, and nothing runs while the vault is missing.
-- A run that fails while watching is reported on one line, without a traceback, and watching goes on.
+- A run that fails while watching is reported on one line, without a traceback, and watching goes on. Two failures end it instead, since no later run could succeed: a vault symlink that now names a directory the index does not belong to, and a system limit (the inotify watch limit, for example) that keeps the vault from being watched again.
 
 ### Indexing
 
 - The vault-ownership check runs before anything is cleared, and a new embedding model must embed a test passage before the old index is discarded. A mistyped model name, or a test run with `PUREMIND_DB` exported, can no longer wipe an index.
-- Nothing is removed from the index when a folder cannot be listed or the vault looks empty while the index is not (an unmounted drive, for example). A note that exists but cannot be read keeps its entry.
+- Notes below a folder that cannot be listed are not removed from the index, and nothing is removed when the vault looks empty while the index is not (an unmounted drive, for example). A note that exists but cannot be read keeps its entry.
 - One bad note no longer stops a run: symlink loops, pipes, names that are not valid UTF-8, and notes that fail to read or chunk are skipped (the last three are also reported). Visible symlinks to hidden or non-Markdown files are skipped, and a note replaced by such a symlink while a run is in progress is not read through it.
 - A failing index file (a full disk, or another process holding the lock too long) stops the run with an error and exit status 2, instead of skipping every remaining note.
 - Notes whose path inside the vault is longer than 1,024 characters are skipped and reported, since `puremind_get` could not open them.
 - Embedding is batched across notes (64 chunks per call), two to four times faster for vaults of small notes in our measurements. When the model fails on a batch, its notes are embedded one at a time, so a note the model cannot handle is skipped and named instead of stopping the run; a model that fails on every note still stops it.
-- `--rebuild` embeds every note again in place, so searches keep finding the old version of each note until it is replaced. It used to empty the index first. (A new embedding model still empties it, since vectors from two models cannot be searched together.)
+- `--rebuild` embeds every note again in place, so searches keep finding the old version of each note until it is replaced. It used to empty the index first. (A new embedding model, or a new revision of it, still empties it, since vectors from two models cannot be searched together. The index records the revision, so a changed `embedder_revision` is noticed like a changed model.)
 - Each note records the version of the chunker that cut it, so a release that changes chunking cuts every note again by itself. 0.1.2 does this once for indexes from earlier versions.
 - Folders nested so deep that no note below them could be opened are not entered. On Python 3.11 a vault nested about 1,000 folders deep used to stop the run.
 - An index whose vault path is spelled differently (APFS ignores letter case) is recognised as the same vault.
@@ -65,7 +65,7 @@ Fixes from a full review of 0.1.1. The first `puremind index` or `watch` run aft
 ### Command line
 
 - `puremind init` writes TOML correctly for any vault path (an emoji in a path made every later command fail), keeps a configured `db` with `--force`, never copies environment overrides into the file, and creates `~/.puremind` as 0700 and config.toml as 0600. A config.toml that is a symlink keeps its target's mode. A malformed config.toml is reported with its path, and `init --force` repairs it.
-- `puremind connect` prints an absolute, quoted command and carries the `PUREMIND_*` and Hugging Face cache variables set in your shell. The Cursor entry has `type: stdio`.
+- `puremind connect` prints an absolute, quoted command and carries the `PUREMIND_*` variables and the Hugging Face cache, offline and endpoint variables set in your shell. The Cursor entry has `type: stdio`.
 - Exit status is 0 on success, 1 when a search finds nothing, 2 on errors (an `error:` line, sometimes followed by a hint or cause line, and no traceback for expected failures) and 130 on Ctrl-C. `puremind serve` now stops on Ctrl-C.
 - `index` and `watch` check the vault directory before opening the index, so a mistyped path no longer creates an empty index, and the error names the path.
 - `puremind serve` no longer writes a library's debug lines to its log.
@@ -87,7 +87,7 @@ Fixes from a full review of 0.1.1. The first `puremind index` or `watch` run aft
 - The version has one source, `puremind_mac.__version__`.
 - CI runs on macOS and Linux with Python 3.11 to 3.13 (and 3.14 on Linux), plus jobs for the mcp 1.x SDK, the lowest allowed dependencies, the built wheel, ruff, pip-audit and gitleaks, and a weekly smoke test with the real models. Actions are pinned to commit SHAs with a read-only token.
 - The test suite is hermetic: it ignores `PUREMIND_*` variables in your shell, runs offline, and never touches your index or vault. Against an installed wheel, its server and command-line subprocesses run the wheel too.
-- `bench/longmemeval.py` uses the current Hugging Face download command, adds LongMemEval's own metrics, records its settings, and resumes safely after a crash.
+- `bench/longmemeval.py` uses the current Hugging Face download command, adds LongMemEval's own metrics, records its settings, follows `[retrieval] rerank`, and resumes safely after a crash.
 
 ## 0.1.1 (2026-10-16)
 

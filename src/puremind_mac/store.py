@@ -214,6 +214,10 @@ def _check_version(conn: sqlite3.Connection, path: str) -> int:
     return version
 
 
+def _has_chunker_column(conn: sqlite3.Connection) -> bool:
+    return "chunker" in {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+
+
 def _checkpoint(conn) -> bool:
     """Copy the -wal file into the database and empty it; False if readers kept it from being emptied.
 
@@ -286,8 +290,12 @@ class Store:
             if self.path != ":memory:":
                 conn.execute("PRAGMA journal_mode = WAL").fetchone()  # fetched so the statement is finished
             conn.executescript(SCHEMA)
-            if "chunker" not in {row[1] for row in conn.execute("PRAGMA table_info(files)")}:
-                conn.execute("ALTER TABLE files ADD COLUMN chunker INTEGER NOT NULL DEFAULT 0")  # 0.1.1 and earlier
+            if not _has_chunker_column(conn):  # 0.1.1 and earlier
+                try:
+                    conn.execute("ALTER TABLE files ADD COLUMN chunker INTEGER NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    if not _has_chunker_column(conn):  # else another process added it meanwhile
+                        raise
             if version != SCHEMA_VERSION:
                 if self.path != ":memory:":
                     _upgrade(conn, self.path)
@@ -489,14 +497,7 @@ class Store:
 
     def fts_search(self, query: str, limit: int = 50) -> list[tuple[int, float]]:
         """FTS5 lexical search. Returns (chunk_id, bm25 score) with larger meaning better."""
-        match = _fts_match(query)
-        if match is None:
-            return []
-        rows = self.db.execute(
-            "SELECT rowid, bm25(chunks_fts) AS s FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY s LIMIT ?",
-            (match, limit),
-        )
-        return [(r["rowid"], -float(r["s"])) for r in rows]
+        return [(chunk.id, score) for chunk, score in self.fts_hits(query, limit)]
 
     def fts_hits(self, query: str, limit: int = 50) -> list[tuple[ChunkRow, float]]:
         """Like ``fts_search`` but returns the chunk rows, read by the same statement as the match."""

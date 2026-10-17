@@ -334,3 +334,15 @@ def test_random_documents_keep_every_chunk_within_the_limit_and_lose_no_word():
         pool = "\n".join(c.content for c in chunks)
         lost = [w for w in set(re.findall(r"\S+", text)) if w not in pool and len(w) <= 12 and not w.startswith(("```", "~~~"))]
         assert not lost, (seed, lost[:3])
+
+
+def test_tiny_sections_merged_across_headings_carry_the_headings_they_share():
+    text = "# Recipes\n## Espresso\nGrind 18 g.\n\n# Taxes\nFiled on April 2nd.\n\n# Garden\nPlant tomatoes in May."
+    chunks = chunk_markdown(text)
+    assert len(chunks) == 1 and chunks[0].heading_path == ""  # not "Recipes > Espresso" for the tax text
+    nested = chunk_markdown("# A\n\nshort\n\n## B\n\nalso short\n")
+    assert [c.heading_path for c in nested] == ["A > B"]  # a section inside the previous one keeps the deeper path
+    cut = "# Recipes\n## Espresso\nGrind 18 g.\n\n# Taxes\nFiled on April 2nd.\n\n# Garden\n## Beds\nCompost the beds."
+    assert [c.heading_path for c in chunk_markdown(cut)] == [""]  # not "Garden > Beds" for the espresso text
+    house = "# Home\n## Kitchen\nNew tap.\n\n## Garage\n### Car\nOil change.\n\n## Garden\n### Shed\nPaint it."
+    assert [c.heading_path for c in chunk_markdown(house)] == ["Home"]

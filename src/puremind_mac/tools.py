@@ -166,6 +166,7 @@ def _read_note(path: Path) -> tuple[str, bool]:
                 f"the note is over {MAX_FILE_BYTES // (1024 * 1024)} MiB; "
                 "pureMind neither indexes nor serves files that large"
             )
+        os.set_blocking(fh.fileno(), True)  # as the indexer does: a cloud placeholder may need to download
         limit = 4 * MAX_GET_CHARS  # UTF-8 uses at most four bytes per character
         data = fh.read(limit + 1)
     return data[:limit].decode("utf-8", errors="replace"), len(data) > limit

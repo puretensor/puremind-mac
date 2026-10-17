@@ -690,6 +690,7 @@ def test_control_characters_in_file_names_and_skipped_files_are_not_printed(home
 def test_clean_keeps_newline_and_tab_only():
     assert cli._clean("a\tb\nc\x1bd\x7fe\x85f\x9fg\rh") == "a\tb\ncdefgh"
     assert cli._one_line("a \x1b[0m  b\n\tc") == "a [0m b c"
+    assert cli._one_line("notes/\u202etxt.exe\u202c.md \u2066x\u2069\u200f") == "notes/txt.exe.md x"  # bidi controls
 
 
 @pytest.mark.parametrize(
@@ -784,7 +785,8 @@ def test_serve_turns_reranking_off_and_leaves_the_project_directory(home, tmp_pa
     assert seen["db"].resolve() == (project / "relative.sqlite").resolve()
 
 
-def test_serve_keeps_reranking_on_by_default(home, monkeypatch):
+def test_serve_keeps_reranking_on_by_default(home, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)  # serve changes into its home; monkeypatch puts the directory back afterwards
     seen = []
 
     class Silent:
