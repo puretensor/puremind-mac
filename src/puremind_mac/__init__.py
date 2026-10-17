@@ -1,3 +1,3 @@
-"""pureMind for Mac: a local memory daemon for AI coding agents."""
+"""pureMind for Mac: local memory for AI coding agents, served over MCP."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

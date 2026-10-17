@@ -1,8 +1,21 @@
+import random
+import re
+import threading
+import unicodedata
+
+import bm25s
 import numpy as np
+import pytest
+import Stemmer
+from fakes import FakeEmbedder, FakeReranker
 
-from puremind_mac.retrieval import HybridIndex, rrf_fuse
-
-from conftest import FakeEmbedder, FakeReranker
+from puremind_mac.retrieval import (
+    _CJK,
+    _CJK_RANGES,
+    HybridIndex,
+    _segment_cjk,
+    rrf_fuse,
+)
 
 DOCS = [
     "tomatoes need compost and mulch in the raised garden beds",
@@ -46,7 +59,8 @@ def test_rrf_k_changes_scores():
 
 def test_lexical_matches_stems_and_ignores_stopwords():
     idx, _ = make_index()
-    assert idx.lexical("the tomato garden", 5) == [0]
+    # "tomato" only matches "tomatoes" through the stemmer, and "the" would match four other documents
+    assert idx.lexical("the tomato", 5) == [0]
 
 
 def test_lexical_returns_nothing_for_unknown_or_stopword_only_queries():
@@ -110,3 +124,191 @@ def test_lexical_only_hit_still_surfaces():
     idx = HybridIndex(docs, vecs)
     emb = FakeEmbedder()
     assert idx.search("gamma", emb, None, limit=2)[0].position == 1
+
+
+# ---- stemming and edge corpora
+
+
+def test_lexical_stems_in_both_directions():
+    idx = HybridIndex(["raised beds", "tomato plants"], None)
+    assert idx.lexical("raising", 5) == [0]  # raised, raising -> rais
+    assert idx.lexical("tomatoes", 5) == [1]
+
+
+@pytest.mark.parametrize(
+    "texts",
+    [["😀😀😀", "🎉🎉"], ["a b c", "x y z"], ["the and of", "it is a"], ["", ""], ["   ", "\n"]],
+    ids=["emoji", "one-letter", "stopwords", "empty", "blank"],
+)
+def test_corpus_without_a_single_token_has_no_lexical_candidates(texts):
+    vecs = FakeEmbedder().embed_documents(["x", "y"])
+    idx = HybridIndex(texts, vecs)
+    assert idx.lexical("party", 5) == []
+    assert idx.lexical("a", 5) == []
+    emb = FakeEmbedder()
+    hits = idx.search("party", emb, None, limit=5)  # the dense side still answers
+    assert sorted(h.position for h in hits) == [0, 1]
+    assert idx.lexical("party", 5) == []  # and asking again does not rebuild or fail
+
+
+def test_a_failed_bm25_build_is_not_cached():
+    idx = HybridIndex(["alpha beta", "gamma delta"], None)
+    real = idx._tokenize
+    calls = []
+
+    def flaky(docs, query=False):
+        calls.append(len(docs))
+        if len(calls) == 1:
+            raise MemoryError("simulated")
+        return real(docs, query)
+
+    idx._tokenize = flaky
+    with pytest.raises(MemoryError):
+        idx.lexical("alpha", 5)
+    assert idx.lexical("alpha", 5) == [0]
+
+
+def test_each_tokenize_call_gets_its_own_stemmer(monkeypatch):
+    made = []
+    real = Stemmer.Stemmer
+
+    def factory(*a, **k):
+        made.append(real(*a, **k))
+        return made[-1]
+
+    monkeypatch.setattr(Stemmer, "Stemmer", factory)
+    idx = HybridIndex(["tomatoes"], None)
+    threads = [threading.Thread(target=idx._tokenize, args=(["gardens"],)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    idx._tokenize(["beds"])
+    assert len(made) == 5 and len({id(m) for m in made}) == 5  # PyStemmer instances must not be shared
+
+
+# ---- Chinese, Japanese and Korean
+
+CJK_DOCS = [
+    "数据库迁移到新的服务器,需要在周末完成。",
+    "今天天气很好,我们去公园散步。",
+    "来週までに移行作業を終わらせる必要があります。",
+    "서울에서 부산까지 기차로 이동했다.",
+    "ジョン・スミスはサーバーを再起動した。",
+    "Deploy the new Kubernetes cluster to production next week.",
+    "GPU加速 and 猫 live here",
+]
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("迁移", [0]),  # Chinese word inside an unspaced sentence
+        ("数据库迁移", [0]),
+        ("天气", [1]),
+        ("移行", [2]),  # Japanese kanji word
+        ("作業を終わらせる", [2]),  # kanji and kana together
+        ("サーバー", [4]),  # katakana with the long-vowel mark
+        ("ジョン", [4]),  # the middle dot is a separator, not part of a name
+        ("서울", [3]),  # Korean word that carries a particle in the text
+        ("부산까지", [3]),
+        ("kubernetes", [5]),  # Latin text next to CJK documents is unaffected
+        ("GPU", [6]),  # Latin glued to CJK is split off
+        ("加速", [6]),
+        ("猫", [6]),  # a lone character matches a lone character
+        ("的", [0]),  # and one inside a longer run, since documents also index every character
+        ("天气 迁移", [0, 1]),  # several words: every document that has one of them
+    ],
+)
+def test_lexical_matches_cjk_words(query, expected):
+    idx = HybridIndex(CJK_DOCS, None)
+    got = idx.lexical(query, 5)
+    assert sorted(got) == expected
+
+
+def test_cjk_query_finds_the_note_through_search():
+    emb = FakeEmbedder()  # its vectors are all zero for CJK text, so only BM25 can find the match
+    idx = HybridIndex(CJK_DOCS, emb.embed_documents(CJK_DOCS))
+    assert idx.search("数据库迁移", emb, None, limit=3)[0].position == 0
+    assert idx.search("移行作業", emb, None, limit=3)[0].position == 2
+
+
+def test_cjk_runs_become_overlapping_bigrams():
+    assert _segment_cjk("数据库") == " 数据 据库 "
+    assert _segment_cjk("迁移") == " 迁移 "
+    assert _segment_cjk("猫") == " 猫 "
+    assert _segment_cjk("数据库", unigrams=True) == " 数 据 库 数据 据库 "  # how documents are indexed
+    assert _segment_cjk("猫", unigrams=True) == " 猫 "
+    assert _segment_cjk("a数据b") == "a 数据 b"
+    assert _segment_cjk("ジョン・スミス") == " ジョ ョン ・ スミ ミス "
+    assert _segment_cjk("서울에서") == " 서울 울에 에서 "
+    beyond_bmp = "\U00020000\U00020001\U00020002"
+    assert _segment_cjk(beyond_bmp) == " \U00020000\U00020001 \U00020001\U00020002 "
+    assert _segment_cjk("你好,世界") == " 你好 , 世界 "  # punctuation ends a run
+
+
+def test_cjk_class_covers_only_word_characters():
+    word = re.compile(r"\w")
+    for lo, hi in _CJK_RANGES:
+        for cp in range(lo, hi + 1):
+            if unicodedata.category(chr(cp)) != "Cn":  # unassigned code points do not matter
+                assert word.match(chr(cp)), hex(cp)  # so a run never contains a character the tokeniser splits on
+
+
+def test_cjk_class_leaves_out_punctuation_and_marks():
+    cjk = re.compile(f"[{_CJK}]")
+    for cp in (0x30FB, 0x30A0, 0x3001, 0x3002, 0x300C, 0xFF0C, 0x3099, 0x309B, 0x0041, 0x00E9):
+        assert not cjk.match(chr(cp)), hex(cp)  # katakana middle dot, CJK punctuation, kana marks, Latin
+
+
+def tokens_of(tok):
+    inverse = {i: t for t, i in tok.vocab.items()}
+    return [[inverse[i] for i in doc] for doc in tok.ids]
+
+
+def legacy_tokenize(docs):
+    """What HybridIndex produced before CJK handling: the stock bm25s call."""
+    return bm25s.tokenize(docs, stopwords="en", stemmer=Stemmer.Stemmer("english"), show_progress=False)
+
+
+def legacy_tokens(docs):
+    return tokens_of(legacy_tokenize(docs))
+
+
+ENGLISH = [
+    "The quick brown fox's jump over the lazy dog's back; see https://example.org/a/b?id=42, v2.0-beta!",
+    "It's 3:45pm - don't panic (really). Tomatoes need compost and mulch in the raised garden beds.",
+    "Decided to migrate the build pipeline to hermetic containers next quarter.\n\n## Notes\n\n```py\nx = 1\n```",
+    (
+        "Résumé café naïve façade Zürich, Ελληνικά, Русский текст, हिन्दी, العربية, "
+        "emoji 😀 and 12,345.67 EUR"
+    ),
+    "",
+]
+
+
+def test_english_and_other_non_cjk_text_tokenises_exactly_as_before():
+    idx = HybridIndex([], None)
+    assert tokens_of(idx._tokenize(ENGLISH)) == legacy_tokens(ENGLISH)
+    assert all(_segment_cjk(t) == t for t in ENGLISH)
+
+
+def test_random_non_cjk_text_tokenises_exactly_as_before():
+    rng = random.Random(20261017)
+    blocks = [(0x20, 0x7E), (0xA0, 0x24F), (0x370, 0x3FF), (0x400, 0x4FF), (0x590, 0x6FF), (0x900, 0x97F),
+              (0xE00, 0xE7F), (0x2000, 0x206F), (0x3000, 0x3004), (0xFF01, 0xFF65), (0x1F300, 0x1F64F)]
+    cjk = re.compile(f"[{_CJK}]")
+    docs = []
+    for _ in range(400):
+        chars = (chr(rng.randint(*rng.choice(blocks))) for _ in range(rng.randint(0, 300)))
+        docs.append("".join(c if rng.random() > 0.15 else " " for c in chars if not cjk.match(c)))
+    assert tokens_of(HybridIndex([], None)._tokenize(docs)) == legacy_tokens(docs)
+
+
+def test_english_lexical_ranking_is_unchanged():
+    legacy = bm25s.BM25()
+    legacy.index(legacy_tokenize(DOCS), show_progress=False)
+    idx, _ = make_index()
+    for q in ("espresso grinder", "tomato garden compost", "the build pipeline", "boiler"):
+        res, scores = legacy.retrieve(legacy_tokenize([q]), k=len(DOCS), show_progress=False)
+        assert idx.lexical(q, len(DOCS)) == [int(j) for j, s in zip(res[0], scores[0]) if s > 0]

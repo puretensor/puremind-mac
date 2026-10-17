@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Config
-from .models import CrossEncoderReranker, Embedder, Reranker, SentenceTransformerEmbedder
+from .models import (
+    CrossEncoderReranker,
+    Embedder,
+    Reranker,
+    SentenceTransformerEmbedder,
+)
 from .retrieval import HybridIndex
 from .store import ChunkRow, Store
 
@@ -25,7 +30,23 @@ class IndexMismatch(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _Snapshot:
+    """The index as of one store generation.
+
+    Positions returned by ``index`` are row numbers in ``chunks``, so the two are kept together
+    and never changed: a request that took a snapshot resolves its hits against that snapshot
+    even if another thread has loaded a newer one in the meantime.
+    """
+
+    gen: int
+    chunks: tuple[ChunkRow, ...]
+    index: HybridIndex
+
+
 class Service:
+    """Store, models and retrieval behind one object. Searches may overlap on several threads."""
+
     def __init__(
         self,
         cfg: Config,
@@ -36,13 +57,13 @@ class Service:
         self.cfg = cfg
         self.store = store or Store(cfg.db_path)
         self.embedder: Embedder = embedder or SentenceTransformerEmbedder(
-            cfg.embedder, cfg.device, cfg.embed_max_seq
+            cfg.embedder, cfg.device, cfg.embed_max_seq, revision=cfg.embedder_revision
         )
-        self.reranker: Reranker = reranker or CrossEncoderReranker(cfg.reranker, cfg.device)
+        self.reranker: Reranker = reranker or CrossEncoderReranker(
+            cfg.reranker, cfg.device, revision=cfg.reranker_revision
+        )
         self._lock = threading.Lock()
-        self._gen = -1
-        self._chunks: list[ChunkRow] = []
-        self._index = HybridIndex([], None)
+        self._snap = _Snapshot(-1, (), HybridIndex([], None))
 
     @property
     def vault_root(self) -> Path | None:
@@ -51,14 +72,15 @@ class Service:
         stored = self.store.get_meta("vault_root")
         return Path(stored) if stored else None
 
-    def _loaded(self) -> HybridIndex:
+    def _loaded(self) -> _Snapshot:
+        """The current snapshot, reloaded from the store if its generation has moved on."""
         with self._lock:
-            gen = self.store.generation()
-            if gen != self._gen:
-                self._chunks, vectors = self.store.load_index()
-                self._index = HybridIndex([c.content for c in self._chunks], vectors if self._chunks else None)
-                self._gen = gen
-            return self._index
+            gen = self.store.generation()  # read first: a write racing the load only costs one extra reload
+            if gen != self._snap.gen:
+                chunks, vectors = self.store.load_index()
+                index = HybridIndex([c.content for c in chunks], vectors if chunks else None)
+                self._snap = _Snapshot(gen, tuple(chunks), index)
+            return self._snap
 
     def search(self, query: str, limit: int = 10, rerank: bool = True) -> list[Hit]:
         built_with = self.store.get_meta("embedder")
@@ -67,10 +89,10 @@ class Service:
                 f"the index was built with {built_with} but {self.embedder.name} is configured; "
                 "run `puremind index --rebuild`"
             )
-        index = self._loaded()
-        if not len(index):
+        snap = self._loaded()
+        if not len(snap.index):
             return []
-        scored = index.search(
+        scored = snap.index.search(
             query,
             self.embedder,
             self.reranker if rerank else None,
@@ -82,14 +104,11 @@ class Service:
         return [
             Hit(c.path, c.heading_path, c.chunk_index, s.score, c.content)
             for s in scored
-            for c in (self._chunks[s.position],)
+            for c in (snap.chunks[s.position],)
         ]
 
     def fts_search(self, query: str, limit: int = 10) -> list[Hit]:
-        rows = self.store.fts_search(query, limit)
-        by_id = {c.id: c for c in self.store.get_chunks([i for i, _ in rows])}
         return [
             Hit(c.path, c.heading_path, c.chunk_index, score, c.content)
-            for i, score in rows
-            for c in (by_id[i],)
+            for c, score in self.store.fts_hits(query, limit)
         ]

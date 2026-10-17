@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Python dependencies declared in pyproject.toml. Floors are deliberate, so only the upper bounds
+  # are widened (a pull request runs the whole workflow against the new major before it is merged).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    versioning-strategy: widen
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+
+  # The SHA-pinned actions in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

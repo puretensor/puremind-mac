@@ -1,63 +1,26 @@
 from __future__ import annotations
 
-import hashlib
-import re
+import os
+import site
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# PUREMIND_TEST_INSTALLED=1 runs the suite against the installed package (the wheel job in CI) instead of the
+# source tree. It is read here, once, because the autouse fixture below removes every PUREMIND_* variable.
+TESTING_INSTALLED = os.environ.get("PUREMIND_TEST_INSTALLED") == "1"
+SRC = Path(__file__).resolve().parents[1] / "src"
+if not TESTING_INSTALLED:
+    sys.path.insert(0, str(SRC))
 
-from puremind_mac.config import Config  # noqa: E402
-from puremind_mac.service import Service  # noqa: E402
-from puremind_mac.store import Store  # noqa: E402
+from fakes import FakeEmbedder, FakeReranker
 
-DIM = 64
+from puremind_mac.config import Config
+from puremind_mac.service import Service
+from puremind_mac.store import Store
 
-
-def _tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
-
-
-class FakeEmbedder:
-    """Hashed bag of words: deterministic, no model, similar texts get similar vectors."""
-
-    name = "fake-embedder"
-
-    def __init__(self):
-        self.doc_calls = 0
-        self.texts_embedded = 0
-
-    def _vec(self, text: str) -> np.ndarray:
-        v = np.zeros(DIM, dtype=np.float32)
-        for t in _tokens(text):
-            v[int(hashlib.md5(t.encode()).hexdigest(), 16) % DIM] += 1.0
-        n = np.linalg.norm(v)
-        return v / n if n else v
-
-    def embed_documents(self, texts):
-        self.doc_calls += 1
-        self.texts_embedded += len(texts)
-        return np.stack([self._vec(t) for t in texts]) if texts else np.zeros((0, DIM), dtype=np.float32)
-
-    def embed_query(self, query):
-        return self._vec(query)
-
-
-class FakeReranker:
-    """Scores by query-token overlap; records what it was asked to score."""
-
-    name = "fake-reranker"
-
-    def __init__(self):
-        self.calls: list[tuple[str, list[str]]] = []
-
-    def score(self, query, passages):
-        self.calls.append((query, list(passages)))
-        q = set(_tokens(query))
-        return [float(len(q & set(_tokens(p)))) for p in passages]
+USER_BASE = site.getuserbase()  # where this interpreter finds user-site packages, before HOME is redirected
 
 
 @pytest.fixture
@@ -106,3 +69,28 @@ def store(cfg):
 @pytest.fixture
 def service(cfg, store, embedder, reranker):
     return Service(cfg, store=store, embedder=embedder, reranker=reranker)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_environment(monkeypatch, tmp_path_factory):
+    """Keep every test away from the developer's real settings, index and model cache.
+
+    All PUREMIND_* variables are removed, the Hugging Face Hub is forced offline, and HOME and PUREMIND_HOME
+    point at a throwaway directory. A test can then neither read ~/.puremind nor write to an index that
+    PUREMIND_DB names in the shell running pytest. Tests that need a variable set it themselves.
+    """
+    for name in [n for n in os.environ if n.startswith("PUREMIND_")]:
+        monkeypatch.delenv(name)
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PYTHONUSERBASE", USER_BASE)  # a child Python must still find the same packages
+    if not TESTING_INSTALLED:  # and import the source tree under test, not some other installed copy
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(SRC), os.environ.get("PYTHONPATH")])))
+    monkeypatch.setenv("PUREMIND_HOME", str(home / ".puremind"))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+
+@pytest.fixture(scope="session")
+def testing_installed() -> bool:
+    """True when the suite runs against an installed package (PUREMIND_TEST_INSTALLED=1)."""
+    return TESTING_INSTALLED
