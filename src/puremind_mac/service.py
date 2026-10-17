@@ -15,7 +15,7 @@ from .models import (
     model_key,
     model_label,
 )
-from .retrieval import HybridIndex
+from .retrieval import HybridIndex, LexiconBuilder
 from .store import ChunkRow, Store
 
 
@@ -66,6 +66,7 @@ class Service:
         )
         self._lock = threading.Lock()
         self._snap = _Snapshot(-1, (), HybridIndex([], None))
+        self._lexicons = LexiconBuilder()  # used under _lock only
 
     def _loaded(self) -> _Snapshot:
         """The current snapshot, reloaded from the store if its generation has moved on."""
@@ -73,7 +74,10 @@ class Service:
             gen = self.store.generation()  # read first: a write racing the load only costs one extra reload
             if gen != self._snap.gen:
                 chunks, vectors = self.store.load_index()
-                index = HybridIndex([c.content for c in chunks], vectors if chunks else None)
+                texts = [c.content for c in chunks]
+                # Only chunks the last snapshot did not hold are tokenized, so a reload after one
+                # saved note costs little even in a large vault.
+                index = HybridIndex(texts, vectors if chunks else None, self._lexicons.build(texts))
                 self._snap = _Snapshot(gen, tuple(chunks), index)
             return self._snap
 

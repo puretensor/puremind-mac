@@ -160,6 +160,8 @@ def watch(
     delay: float = 2.0,
     stop: threading.Event | None = None,
     rescan: float = RESCAN,
+    quiet: Callable[[], None] | None = None,
+    quiet_after: float = 60.0,
 ) -> None:
     """Run ``run_index`` once, then again each time the vault has been quiet for ``delay`` seconds.
 
@@ -168,8 +170,10 @@ def watch(
     except the first, whose error propagates. If the vault directory is replaced or made
     again (a remount, or a sync tool swapping it), the new directory is watched and indexed;
     while it is missing or cannot be read, nothing runs. After ``rescan`` seconds without a
-    run the vault is indexed anyway, in case the observer missed an event. Returns when
-    ``stop`` is set. Ctrl-C raises KeyboardInterrupt here after the observer has been shut down.
+    run the vault is indexed anyway, in case the observer missed an event. ``quiet`` is called
+    once ``quiet_after`` seconds after a run when no change has come in since, on the same
+    thread; it fails as a run does. Returns when ``stop`` is set. Ctrl-C raises
+    KeyboardInterrupt here after the observer has been shut down.
     """
     stop = stop or threading.Event()
     settle = Settle(delay)
@@ -204,7 +208,15 @@ def watch(
         if not stop.is_set():
             run_index()
         last_run = time.monotonic()
+        quiet_due = last_run + quiet_after if quiet else None
         while not stop.is_set():
+            if quiet_due is not None and time.monotonic() >= quiet_due and settle.remaining() is None:
+                quiet_due = None
+                try:
+                    quiet()
+                except Exception as exc:  # keep watching, as after a failed run
+                    log.error("%s", _one_line(exc))
+                    log.debug("quiet-time work failed", exc_info=True)
             current = _identity(root)
             recreated = current is not None and current == identity and armed and deaf()
             if current != identity or recreated or (current is not None and not armed):
@@ -239,6 +251,7 @@ def watch(
                 log.error("index run failed: %s", _one_line(exc))
                 log.debug("index run failed", exc_info=True)
             last_run = time.monotonic()
+            quiet_due = last_run + quiet_after if quiet else None
     finally:
         observer.stop()
         observer.join(timeout=5)

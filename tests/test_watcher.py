@@ -437,7 +437,7 @@ def test_puremind_watch_prints_what_it_skipped(vault, tmp_path, monkeypatch, cap
     monkeypatch.setattr("puremind_mac.indexer.MAX_FILE_BYTES", 50)
     stub = SimpleNamespace(name="stub", embed_documents=lambda texts: np.ones((len(texts), 4), dtype="float32"))
     monkeypatch.setattr("puremind_mac.service.SentenceTransformerEmbedder", lambda *a, **k: stub)
-    monkeypatch.setattr("puremind_mac.watcher.watch", lambda vault, run_index, delay, stop=None: run_index())  # one run
+    monkeypatch.setattr("puremind_mac.watcher.watch", lambda vault, run_index, delay, stop=None, **kw: run_index())  # one run
     (vault / "evil\x1b]0;TITLE\x07.md").write_text("x" * 100)
     assert cli.main(["watch", str(vault), "--debounce", "0.1"]) == 0
     out = capsys.readouterr()
@@ -461,7 +461,7 @@ def test_puremind_watch_stops_when_a_symlinked_vault_names_another_directory(tmp
     stub = SimpleNamespace(name="stub", embed_documents=lambda texts: np.ones((len(texts), 4), dtype="float32"))
     monkeypatch.setattr("puremind_mac.service.SentenceTransformerEmbedder", lambda *a, **k: stub)
 
-    def two_runs(vault, run_index, delay, stop):
+    def two_runs(vault, run_index, delay, stop, **kw):
         run_index()
         link.unlink()
         link.symlink_to(second)  # the index belongs to the first directory: every later run is refused
@@ -491,7 +491,7 @@ def test_a_stale_puremind_watch_stops_instead_of_wiping_an_index_rebuilt_for_ano
 
     monkeypatch.setattr("puremind_mac.service.SentenceTransformerEmbedder", lambda *a, **k: stub("old-model"))
 
-    def two_runs(vault, run_index, delay, stop):
+    def two_runs(vault, run_index, delay, stop, **kw):
         run_index()
         store = Store(home / "index.sqlite")
         try:  # `puremind index --rebuild` with the new config, while this watch still has the old one
@@ -511,6 +511,97 @@ def test_a_stale_puremind_watch_stops_instead_of_wiping_an_index_rebuilt_for_ano
         assert store.get_meta("embedder") == "new-model" and store.stats()["files"] == 3
     finally:
         store.close()
+
+
+def _stub_models(monkeypatch, name="stub"):
+    import numpy as np
+
+    stub = SimpleNamespace(name=name, embed_documents=lambda texts: np.ones((len(texts), 4), dtype="float32"))
+    monkeypatch.setattr("puremind_mac.service.SentenceTransformerEmbedder", lambda *a, **k: stub)
+
+
+def _compaction_owed(db):
+    from puremind_mac.store import Store
+
+    store = Store(db)
+    try:
+        return store.purge_pending()
+    finally:
+        store.close()
+
+
+def test_puremind_watch_compacts_on_its_first_run_when_quiet_and_on_exit(vault, tmp_path, monkeypatch):
+    from puremind_mac import cli
+    from puremind_mac.store import Store
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("PUREMIND_HOME", str(home))
+    monkeypatch.delenv("PUREMIND_DB", raising=False)
+    _stub_models(monkeypatch)
+    assert cli.main(["index", str(vault)]) == 0
+    store = Store(home / "index.sqlite")
+    store.defer_purge()  # what a watch that crashed leaves behind
+    store.close()
+    db, note, seen = home / "index.sqlite", vault / "projects" / "garden.md", []
+
+    def fake_watch(vault_, run_index, delay, stop, quiet, quiet_after):
+        assert quiet_after == cli.PURGE_WHEN_QUIET
+        run_index()  # the first run pays what was owed
+        seen.append(_compaction_owed(db))
+        note.write_text("# Garden plan\n\nPlant zucchini in June.\n")
+        run_index()  # a save: the compaction is put off
+        seen.append(_compaction_owed(db))
+        quiet()  # the vault has been quiet for a while
+        seen.append(_compaction_owed(db))
+        note.write_text("# Garden plan\n\nPlant leeks in March.\n")
+        run_index()
+        seen.append(_compaction_owed(db))  # owed again, and paid when watching stops
+
+    monkeypatch.setattr("puremind_mac.watcher.watch", fake_watch)
+    assert cli.main(["watch", str(vault)]) == 0
+    assert seen == [False, True, False, True]
+    assert not _compaction_owed(db)
+
+
+def test_puremind_watch_compacts_anyway_when_the_vault_never_goes_quiet(vault, tmp_path, monkeypatch):
+    from puremind_mac import cli
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("PUREMIND_HOME", str(home))
+    monkeypatch.delenv("PUREMIND_DB", raising=False)
+    _stub_models(monkeypatch)
+    monkeypatch.setattr(cli, "PURGE_AT_LEAST_EVERY", 0.0)
+    db, note, seen = home / "index.sqlite", vault / "projects" / "garden.md", []
+
+    def fake_watch(vault_, run_index, delay, stop, quiet, quiet_after):
+        run_index()
+        for crop in ("zucchini", "leeks"):  # saves that keep coming, never a quiet spell
+            note.write_text(f"# Garden plan\n\nPlant {crop}.\n")
+            run_index()
+            seen.append(_compaction_owed(db))
+
+    monkeypatch.setattr("puremind_mac.watcher.watch", fake_watch)
+    assert cli.main(["watch", str(vault)]) == 0
+    assert seen == [True, False]  # the second save is past the limit, so its run compacts
+
+
+def test_quiet_work_runs_once_after_each_quiet_spell(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    runs, quiets = [], []
+    stop, thread = _watch_in_thread(vault, lambda: runs.append(1), quiet=lambda: quiets.append(len(runs)), quiet_after=0.3)
+    try:
+        # FSEvents may report the vault's own creation after watching starts, which costs a second run.
+        assert wait_for(lambda: quiets and quiets[-1] == len(runs))  # after the last run
+        time.sleep(0.8)
+        assert len(set(quiets)) == len(quiets)  # once per quiet spell: never twice without a run between
+        before = len(quiets)
+        (vault / "a.md").write_text("# a\n")
+        assert wait_for(lambda: len(quiets) > before and quiets[-1] == len(runs))
+        assert len(set(quiets)) == len(quiets) and quiets == sorted(quiets)
+    finally:
+        stop.set()
+        thread.join(PATIENT)
 
 
 def test_puremind_watch_names_a_missing_vault(tmp_path, monkeypatch, capsys):

@@ -375,7 +375,21 @@ class Store:
         self._check_writable()
         with self.db:
             self.db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('optimize')")
+            self.db.execute("DELETE FROM meta WHERE key = 'purge_pending'")
         return self.checkpoint()
+
+    def defer_purge(self) -> bool:
+        """Note in the index that ``purge`` is still owed, so that a process that stops before
+        paying it (a crash, a power cut) leaves the debt to the next one, and empty the -wal file.
+        The deleted chunks' text is already gone from the tables; only the keyword index still
+        holds their words. Returns what ``checkpoint`` returns."""
+        self._check_writable()
+        with self.db:
+            self.db.execute("INSERT INTO meta(key, value) VALUES ('purge_pending', '1') ON CONFLICT(key) DO NOTHING")
+        return self.checkpoint()
+
+    def purge_pending(self) -> bool:
+        return self.get_meta("purge_pending") is not None
 
     def __enter__(self) -> Self:
         return self
@@ -468,6 +482,7 @@ class Store:
         with self.db:
             self.db.execute("DELETE FROM files")
             self.db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")  # empties the keyword index outright
+            self.db.execute("DELETE FROM meta WHERE key = 'purge_pending'")
             self._bump()
         if self.path != ":memory:":
             with self.db:  # no transaction is open here, which VACUUM needs
@@ -492,8 +507,11 @@ class Store:
         chunks = [ChunkRow(r["id"], r["path"], r["chunk_index"], r["heading_path"], r["content"]) for r in rows]
         if not rows:
             return chunks, np.zeros((0, 0), dtype=np.float32)
-        mat = np.stack([np.frombuffer(r["vec"], dtype=np.float16) for r in rows]).astype(np.float32)
-        return chunks, mat
+        dims = {r["dim"] for r in rows}
+        if len(dims) != 1 or any(len(r["vec"]) != 2 * r["dim"] for r in rows):
+            raise ValueError("the vectors in the index do not all have the same length; run `puremind index --rebuild`")
+        mat = np.frombuffer(b"".join(r["vec"] for r in rows), dtype=np.float16).reshape(len(rows), dims.pop())
+        return chunks, mat.astype(np.float32)
 
     def fts_search(self, query: str, limit: int = 50) -> list[tuple[int, float]]:
         """FTS5 lexical search. Returns (chunk_id, bm25 score) with larger meaning better."""

@@ -104,3 +104,23 @@ def test_an_index_built_at_another_embedder_revision_is_refused(cfg, store, vaul
     embedder.revision = "rev-b"
     with pytest.raises(IndexMismatch, match="revision rev-a but revision rev-b"):
         Service(cfg, store=store, embedder=embedder, reranker=reranker).search("espresso", rerank=False)
+
+
+def test_a_reload_after_one_saved_note_tokenizes_only_that_note(cfg, store, vault, embedder, reranker, monkeypatch):
+    from puremind_mac import retrieval
+
+    index_vault(vault, store, embedder)
+    corpus = []
+    real = retrieval.tokenize
+    monkeypatch.setattr(
+        retrieval, "tokenize", lambda docs, query=False: (corpus.append(len(docs)) if not query else None, real(docs, query))[1]
+    )
+    svc = Service(cfg, store=store, embedder=embedder, reranker=reranker)
+    svc.search("espresso", rerank=False)
+    assert corpus == [store.stats()["chunks"]]
+    (vault / "projects" / "garden.md").write_text("# Garden plan\n\nPlant zucchini in June.\n")
+    index_vault(vault, store, embedder)
+    hits = svc.search("zucchini", rerank=False)
+    assert corpus[1:] == [1]  # the one new chunk; the others come from the previous snapshot
+    assert hits[0].path == "projects/garden.md" and "zucchini" in hits[0].content
+    assert not any("tomatoes" in h.content for h in svc.search("tomatoes", rerank=False))

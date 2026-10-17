@@ -61,6 +61,7 @@ class IndexStats:
     skipped: list[str] = field(default_factory=list)
     removal_skipped: str = ""  # why notes missing from the scan were not removed from the index
     stopped: bool = False  # the run was asked to stop before it finished
+    purge_deferred: bool = False  # the keyword index still holds words of text this run removed
 
     def summary(self) -> str:
         s = (
@@ -420,6 +421,7 @@ def index_vault(
     rebuild: bool = False,
     *,
     should_stop: Callable[[], bool] | None = None,
+    purge: bool = True,
 ) -> IndexStats:
     """Bring the index in line with the vault.
 
@@ -429,6 +431,12 @@ def index_vault(
     vectors from two models cannot be searched together. Notes cut by an earlier chunker are cut
     and embedded again. ``should_stop`` is polled between notes; once it returns True the run
     ends early without removing anything.
+
+    Text a run removes or replaces leaves the tables at once. Its words leave the keyword index
+    when the index is compacted (``Store.purge``), which takes about half a second at 50,000
+    chunks. With ``purge`` the run compacts at its end, also paying a compaction an earlier run
+    put off; without it, the run only records that one is owed (``stats.purge_deferred``) and the
+    caller pays it later, as ``puremind watch`` does.
     """
     vault = vault.expanduser().resolve()
     if not vault.is_dir():
@@ -488,7 +496,16 @@ def index_vault(
         for rel in gone:
             store.delete_file(rel)
             stats.removed += 1
-    if (stats.removed or stats.updated) and not store.purge():  # clear() purges by itself
+    emptied = True
+    if stats.removed or stats.updated:  # clear() purges by itself
+        if purge:
+            emptied = store.purge()
+        else:
+            emptied = store.defer_purge()
+            stats.purge_deferred = True
+    elif purge and store.purge_pending():  # owed by a `puremind watch` that stopped before paying it
+        emptied = store.purge()
+    if not emptied:
         log.warning(
             "another process was reading the index, so text deleted or replaced in this run stays in "
             "%s-wal until the next run", store.path,

@@ -698,3 +698,23 @@ def test_an_old_index_whose_column_another_process_just_added_still_opens(tmp_pa
     real = store_module._has_chunker_column
     monkeypatch.setattr(store_module, "_has_chunker_column", lambda conn: next(checks, None) or real(conn))
     Store(path).close()
+
+
+def test_vectors_of_different_lengths_are_refused(store):
+    store.replace_file("a.md", "h", 0.0, 1, "A", [("", "alpha")], np.ones((1, 4), dtype=np.float32))
+    store.replace_file("b.md", "h", 0.0, 1, "B", [("", "beta")], np.ones((1, 8), dtype=np.float32))
+    with pytest.raises(ValueError, match="same length"):
+        store.load_index()
+
+
+def test_a_deferred_purge_is_recorded_until_a_purge_or_clear(store):
+    store.replace_file("a.md", "h", 0.0, 1, "A", [("", "alpha")], np.ones((1, 4), dtype=np.float32))
+    assert not store.purge_pending()
+    store.defer_purge()
+    store.defer_purge()
+    assert store.purge_pending()
+    store.purge()
+    assert not store.purge_pending()
+    store.defer_purge()
+    store.clear()
+    assert not store.purge_pending()

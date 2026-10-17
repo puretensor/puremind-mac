@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from fakes import FakeReranker
 
+from puremind_mac import retrieval
 from puremind_mac.indexer import index_vault
 from puremind_mac.retrieval import HybridIndex
 from puremind_mac.server import build_server
@@ -55,16 +56,16 @@ def run_threads(threads, timeout=60):
 
 def slow_corpus_tokenizer(monkeypatch, delay=0.15):
     """Make building a BM25 index slow, so every other thread arrives while it is being built."""
-    real = HybridIndex._tokenize
+    real = retrieval.tokenize
     builds = []
 
-    def tokenize(self, docs, query=False):
+    def tokenize(docs, query=False):
         if not query:  # the corpus
             builds.append(len(docs))
             time.sleep(delay)
-        return real(self, docs, query)
+        return real(docs, query)
 
-    monkeypatch.setattr(HybridIndex, "_tokenize", tokenize)
+    monkeypatch.setattr(retrieval, "tokenize", tokenize)
     return builds
 
 
