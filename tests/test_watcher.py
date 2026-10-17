@@ -7,6 +7,7 @@ events in question, then lets the debounce expire a few times over.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import queue
@@ -49,7 +50,8 @@ class Watching:
         self.active = self.most_active = 0
         self.stop = threading.Event()
         self.failure: BaseException | None = None
-        self.thread = threading.Thread(target=self._main, name="watch-thread")
+        # A daemon, so that a failing assertion in __enter__ (which skips __exit__) cannot hang the run.
+        self.thread = threading.Thread(target=self._main, name="watch-thread", daemon=True)
         self._lock = threading.Lock()
         original = watcher._Handler.on_any_event
         events = self.events
@@ -443,6 +445,34 @@ def test_puremind_watch_prints_what_it_skipped(vault, tmp_path, monkeypatch, cap
     assert "skipped: evil]0;TITLE.md (over 50 bytes)" in out.err  # no escape sequence reaches the terminal
 
 
+def test_puremind_watch_stops_when_a_symlinked_vault_names_another_directory(tmp_path, monkeypatch, capsys):
+    import numpy as np
+
+    from puremind_mac import cli
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    for folder in (first, second):
+        folder.mkdir()
+        (folder / "a.md").write_text(f"# {folder.name}\n")
+    link = tmp_path / "vault"
+    link.symlink_to(first)
+    monkeypatch.setenv("PUREMIND_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PUREMIND_DB", raising=False)
+    stub = SimpleNamespace(name="stub", embed_documents=lambda texts: np.ones((len(texts), 4), dtype="float32"))
+    monkeypatch.setattr("puremind_mac.service.SentenceTransformerEmbedder", lambda *a, **k: stub)
+
+    def two_runs(vault, run_index, delay, stop):
+        run_index()
+        link.unlink()
+        link.symlink_to(second)  # the index belongs to the first directory: every later run is refused
+        run_index()
+        assert stop.is_set()
+
+    monkeypatch.setattr("puremind_mac.watcher.watch", two_runs)
+    assert cli.main(["watch", str(link)]) == 2
+    assert "error: this index belongs to" in capsys.readouterr().err
+
+
 def test_puremind_watch_names_a_missing_vault(tmp_path, monkeypatch, capsys):
     from puremind_mac import cli
 
@@ -712,3 +742,45 @@ def test_ctrl_c_while_the_model_is_busy_exits_130_cleanly(tmp_path, vault, slow_
             proc.kill()
     assert code == 130, stderr
     assert "Traceback" not in stderr and "terminate called" not in stderr
+
+
+def test_events_under_another_spelling_of_the_vault_still_count(tmp_path):
+    vault = tmp_path / "Notes"
+    vault.mkdir()
+    pokes = []
+    handler = watcher._Handler(tmp_path / "notes", SimpleNamespace(poke=lambda: pokes.append(1)))
+    handler.on_any_event(_event("modified", str(vault / "a.md")))  # FSEvents reports the spelling on disk
+    handler.on_any_event(_event("modified", str(vault / ".obsidian" / "b.md")))
+    assert len(pokes) == 1
+    assert relevant(str(tmp_path / "Café" / "a.md"), tmp_path / "Café")  # NFD on disk, NFC as typed
+
+
+def test_a_system_limit_while_watching_again_ends_watching(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    observer = FlakyObserver()
+
+    def schedule(handler, path, **kwargs):
+        if observer.scheduled:
+            raise OSError(errno.ENOSPC, "inotify watch limit reached")
+        observer.scheduled += 1
+
+    observer.schedule = schedule
+    monkeypatch.setattr(watcher, "Observer", lambda: observer)
+    failure = []
+
+    def main():
+        try:
+            watch(vault, lambda: None, delay=DELAY)
+        except OSError as exc:
+            failure.append(exc)
+
+    thread = threading.Thread(target=main, daemon=True)  # a regression must fail the test, not hang the run
+    thread.start()
+    try:
+        assert wait_for(lambda: observer.scheduled == 1)
+        observer.alive = False  # the watch ended; re-arming now hits the limit, which retrying cannot fix
+        thread.join(PATIENT)
+    finally:
+        assert not thread.is_alive()
+    assert failure and failure[0].errno == errno.ENOSPC

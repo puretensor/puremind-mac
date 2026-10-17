@@ -12,6 +12,7 @@ directory instead: the cached Hub snapshot, downloaded once if it is missing, or
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -97,10 +98,40 @@ def is_local_path(name: str) -> bool:
     return os.path.isabs(name) or name.startswith(("./", "../", "~")) or name in (".", "..")
 
 
+def model_key(name: str) -> str:
+    """``name`` as the index records and compares it: a local path made absolute, a Hub id as it is.
+
+    `puremind serve` and the `connect` entry make local model paths absolute, while `index` may get
+    the same directory as ``~/models/e``; both spellings must name the same model.
+    """
+    return os.path.abspath(os.path.expanduser(name)) if is_local_path(name) else name
+
+
+def model_label(name: str) -> str:
+    """``name`` as messages show it: a local directory by its last component, so that no message
+    names a local path (they reach the agent). The CLI prints the full path from the cause."""
+    if not is_local_path(name):
+        return name
+    return f"{os.path.basename(os.path.normpath(os.path.expanduser(name))) or name} (a local directory)"
+
+
+def embedder_revision(embedder: object) -> str:
+    """The Hub revision whose weights ``embedder`` computes, "" when it names none (a local
+    directory, a stand-in). Vectors of two revisions are as incompatible as those of two models."""
+    return getattr(embedder, "revision", None) or ""
+
+
+def _offline_switch() -> str | None:
+    """The Hugging Face offline variable that is set, if any."""
+    for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        if os.environ.get(name, "").strip().lower() in ("1", "on", "yes", "true"):
+            return name
+    return None
+
+
 def offline() -> bool:
     """True when the Hugging Face offline switch is set, so nothing may be downloaded."""
-    switches = (os.environ.get(v, "") for v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"))
-    return any(value.strip().lower() in ("1", "on", "yes", "true") for value in switches)
+    return _offline_switch() is not None
 
 
 def _unreachable(timeout: float = 5.0) -> str | None:
@@ -175,7 +206,9 @@ def resolve_model(name: str, revision: str | None = None, *, namespace: str | No
     if is_local_path(name):
         path = Path(name).expanduser()
         if not path.is_dir():
-            raise ModelLoadError(f"model directory not found: {name}")
+            raise ModelLoadError(f"model directory not found: {model_label(name)}") from FileNotFoundError(
+                errno.ENOENT, "no such directory", os.path.abspath(path)
+            )
         return os.path.abspath(path)
     revision = revision or PINNED_REVISIONS.get(name)
     repo = f"{namespace}/{name}" if namespace and "/" not in name else name
@@ -205,26 +238,25 @@ def resolve_model(name: str, revision: str | None = None, *, namespace: str | No
         )
     else:
         problem = f"model {name} is not downloaded yet"
-    if offline():
+    if (switch := _offline_switch()) is not None:
+        blocked = f"offline mode ({switch}) is on; unset it and run the command again with network access to download it"
+    elif (why := _unreachable()) is not None:
+        blocked = f"the Hugging Face Hub cannot be reached ({why}); connect to the network and run the command again"
+    else:
+        blocked = None
+    if blocked is not None:
         if problem is None:
             return os.path.abspath(partial)
-        raise ModelLoadError(
-            f"{problem}, and offline mode (HF_HUB_OFFLINE) is on; unset it and run the command again "
-            "with network access to download it"
-        ) from cached_error
-    if (why := _unreachable()) is not None:
-        if problem is None:
-            return os.path.abspath(partial)
-        raise ModelLoadError(
-            f"{problem}, and the Hugging Face Hub cannot be reached ({why}); "
-            "connect to the network and run the command again"
-        ) from cached_error
+        raise ModelLoadError(f"{problem}, and {blocked}") from cached_error
     log.warning(
         "downloading %s%s from the Hugging Face Hub (one time only)", repo, f" at {revision}" if revision else ""
     )
     try:
         path = snapshot_download(repo, revision=revision, allow_patterns=list(HUB_FILE_PATTERNS))
     except Exception as exc:
+        if problem is None:  # completing the copy failed, but the loaders have what they need
+            log.warning("could not complete the cached copy of %s (%s); using it as it is", repo, type(exc).__name__)
+            return os.path.abspath(partial)
         raise ModelLoadError(
             f"could not download model {name} ({type(exc).__name__}); check the model name and the network, "
             "then run the command again. To load a local directory, give an absolute path or one starting "
@@ -275,8 +307,14 @@ class SentenceTransformerEmbedder:
         self._batch = batch_size
         self._long_batch = max(1, min(batch_size, _ATTENTION_BUDGET // (max_seq * max_seq)))
         self._revision = revision
+        # What resolve_model loads: the pinned commit of a default model when none is given.
+        self.revision = None if is_local_path(model) else revision or PINNED_REVISIONS.get(model)
         self._model = None
         self._lock = threading.Lock()
+        # Searches overlap on MCP worker threads, but one model must not run two calls at once: its
+        # fast tokenizer raises "Already borrowed" when two threads use it, and devices such as mps
+        # are not safe for concurrent forward passes on one model.
+        self._busy = threading.Lock()
 
     def _load(self):
         with self._lock:
@@ -290,7 +328,7 @@ class SentenceTransformerEmbedder:
                     )
                     m.max_seq_length = self._max_seq
                 except Exception as exc:
-                    raise ModelLoadError(f"could not load model {self.name} ({type(exc).__name__})") from exc
+                    raise ModelLoadError(f"could not load model {model_label(self.name)} ({type(exc).__name__})") from exc
                 self._model = m
         return self._model
 
@@ -306,21 +344,24 @@ class SentenceTransformerEmbedder:
         out = None
         for rows, batch in ((short, self._batch), (long, self._long_batch)):
             if rows:
-                vectors = np.asarray(
-                    model.encode(
-                        [texts[i] for i in rows],
-                        batch_size=batch,
-                        normalize_embeddings=True,
-                        show_progress_bar=False,
+                with self._busy:
+                    vectors = np.asarray(
+                        model.encode(
+                            [texts[i] for i in rows],
+                            batch_size=batch,
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                        )
                     )
-                )
                 if out is None:
                     out = np.zeros((len(texts), vectors.shape[1]), dtype=np.float32)
                 out[rows] = vectors
         return _normalise(out)
 
     def embed_query(self, query: str) -> np.ndarray:
-        out = self._load().encode([QUERY_INSTRUCTION + query], normalize_embeddings=True, show_progress_bar=False)
+        model = self._load()
+        with self._busy:
+            out = model.encode([QUERY_INSTRUCTION + query], normalize_embeddings=True, show_progress_bar=False)
         return _normalise(out)[0]
 
 
@@ -334,6 +375,7 @@ class CrossEncoderReranker:
         self._revision = revision
         self._model = None
         self._lock = threading.Lock()
+        self._busy = threading.Lock()  # one call at a time, as for the embedder
 
     def _load(self):
         with self._lock:
@@ -347,7 +389,7 @@ class CrossEncoderReranker:
                         trust_remote_code=False, local_files_only=True,
                     )
                 except Exception as exc:
-                    raise ModelLoadError(f"could not load model {self.name} ({type(exc).__name__})") from exc
+                    raise ModelLoadError(f"could not load model {model_label(self.name)} ({type(exc).__name__})") from exc
                 self._model = m
         return self._model
 
@@ -357,5 +399,7 @@ class CrossEncoderReranker:
         if not passages:
             return []
         q = query[: self._query_chars]
-        scores = self._load().predict([(q, p) for p in passages], show_progress_bar=False)
+        model = self._load()
+        with self._busy:
+            scores = model.predict([(q, p) for p in passages], show_progress_bar=False)
         return [float(s) for s in np.asarray(scores).reshape(-1)]

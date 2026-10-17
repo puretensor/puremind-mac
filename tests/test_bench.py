@@ -300,7 +300,7 @@ def cli_stubs(monkeypatch, embedder, reranker):
     """Config and the two model classes replaced by stubs that record how the harness builds them."""
     built = {}
     cfg = SimpleNamespace(embedder="org/embed", reranker="org/rank", embedder_revision="rev-e",
-                          reranker_revision="rev-r", device="cpu", candidates=50, rrf_k=60, rerank_chars=800)
+                          reranker_revision="rev-r", device="cpu", candidates=50, rrf_k=60, rerank_chars=800, rerank=True)
 
     def make_embedder(model, device, max_seq, *, revision):
         built["embedder"] = (model, device, max_seq, revision)
@@ -355,7 +355,7 @@ def test_main_max_seq_and_no_rerank(tmp_path, data_file, cli_stubs):
 def test_main_records_the_device_that_auto_resolves_to(tmp_path, data_file, cli_stubs, monkeypatch):
     monkeypatch.setattr(lme, "load_config", lambda: SimpleNamespace(
         embedder="org/embed", reranker="org/rank", embedder_revision=None, reranker_revision=None,
-        device="auto", candidates=50, rrf_k=60, rerank_chars=800))
+        device="auto", candidates=50, rrf_k=60, rerank_chars=800, rerank=True))
     monkeypatch.setattr(lme, "pick_device", lambda requested: "mps" if requested == "auto" else requested)
     out = tmp_path / "out"
     assert run_main(data_file, out) == 0

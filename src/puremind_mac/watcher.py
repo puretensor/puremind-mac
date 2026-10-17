@@ -7,10 +7,12 @@ interrupts the one place where work happens.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -44,6 +46,8 @@ EVENT_FILTER = [
 ]
 TICK = 0.25  # how often the loop looks at the clock, at ``stop`` and at the vault directory
 RESCAN = 600.0  # seconds without a run after which the vault is scanned anyway, in case an event was missed
+# Errors of observer.schedule() that retrying cannot fix: the watch or instance limit, or no file descriptors left.
+_LIMITS = frozenset({errno.ENOSPC, errno.EMFILE, errno.ENFILE, errno.ENOMEM})
 
 
 class Settle:
@@ -74,6 +78,26 @@ class Settle:
             return True
 
 
+def _fold(name: str) -> str:
+    return unicodedata.normalize("NFD", name).casefold()
+
+
+def _below(p: Path, root: Path) -> tuple[str, ...] | None:
+    """The parts of ``p`` below ``root``, or None if it is not inside it.
+
+    The vault may be spelled with another letter case or Unicode normalisation than the one on
+    disk (APFS ignores both, and FSEvents reports the spelling on disk), so that still counts as inside.
+    """
+    try:
+        return p.relative_to(root).parts
+    except ValueError:
+        pass
+    n = len(root.parts)
+    if len(p.parts) >= n and all(_fold(a) == _fold(b) for a, b in zip(p.parts, root.parts)):
+        return p.parts[n:]
+    return None
+
+
 def relevant(path: str, root: Path | None = None, *, directory: bool = False) -> bool:
     """Whether a change at ``path`` can alter what discover() finds.
 
@@ -83,11 +107,10 @@ def relevant(path: str, root: Path | None = None, *, directory: bool = False) ->
     """
     p = Path(path)
     if root is None:
-        parts: Sequence[str] = (p.name,)
+        parts: Sequence[str] | None = (p.name,)
     else:
-        try:
-            parts = p.relative_to(root).parts
-        except ValueError:
+        parts = _below(p, root)
+        if parts is None:
             return False
     if any(_excluded_part(part) for part in parts):
         return False
@@ -155,11 +178,17 @@ def watch(
 
     def arm() -> bool:
         """Watch ``root`` with a new handler, since a symlinked vault may now resolve somewhere else.
-        False if the directory went away again before it could be watched."""
+        False if the directory went away again before it could be watched.
+
+        A system limit (the inotify watch or instance limit, too many open files) is raised: it does
+        not pass by itself, and every failed attempt leaks an inotify instance inside watchdog.
+        """
         observer.unschedule_all()
         try:
             observer.schedule(_Handler(root, settle), str(root), recursive=True, event_filter=EVENT_FILTER)
-        except OSError:
+        except OSError as exc:
+            if exc.errno in _LIMITS:
+                raise
             return False
         return True
 

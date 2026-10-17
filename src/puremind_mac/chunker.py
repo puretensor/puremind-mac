@@ -169,28 +169,52 @@ def _parent(path: str) -> str:
     return path.rsplit(" > ", 1)[0] if " > " in path else ""
 
 
-def _depth(path: str) -> int:
-    return path.count(" > ") + 1 if path else 0
+def _crumbs(path: str) -> list[str]:
+    return path.split(" > ") if path else []
+
+
+def _inside(outer: str, inner: str) -> bool:
+    """True if the section ``inner`` lies inside the section ``outer`` (or is it)."""
+    a, b = _crumbs(outer), _crumbs(inner)
+    return b[: len(a)] == a
+
+
+def _shared(a: str, b: str) -> str:
+    """The headings two breadcrumbs have in common."""
+    pa, pb = _crumbs(a), _crumbs(b)
+    n = 0
+    while n < min(len(pa), len(pb)) and pa[n] == pb[n]:
+        n += 1
+    return " > ".join(pa[:n])
 
 
 def _merge_small(sections: list[_Section], min_chars: int) -> list[tuple[str, list[str]]]:
     """Merge tiny sections into the previous sibling, or into a previous chunk that is tiny too.
 
     The second case bounds the chunk count of outlines made of one-word headings,
-    which share no parent and would otherwise become one chunk each.
+    which share no parent and would otherwise become one chunk each. Such a chunk
+    carries the headings its sections share, not those of the first one alone.
     """
     merged: list[tuple[str, list[str]]] = []
     size = 0  # characters in the last group
+    chain = True  # each section of the last group lies inside the one before, so the deepest path names them all
     for sec in sections:
-        if merged and len(sec.body) < min_chars and (_parent(sec.path) == _parent(merged[-1][0]) or size < min_chars):
+        sibling = bool(merged) and _parent(sec.path) == _parent(merged[-1][0])
+        if merged and len(sec.body) < min_chars and (sibling or size < min_chars):
             prev_path, parts = merged[-1]
             parts.append(sec.body)
             size += len(sec.body) + 2
-            if _depth(sec.path) > _depth(prev_path):
+            if sibling:
+                chain = False  # the group keeps its first section's path, as siblings always have
+            elif chain and _inside(prev_path, sec.path):
                 merged[-1] = (sec.path, parts)
+            else:
+                merged[-1] = (_shared(prev_path, sec.path), parts)
+                chain = False
         else:
             merged.append((sec.path, [sec.body]))
             size = len(sec.body)
+            chain = True
     return merged
 
 

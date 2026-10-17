@@ -80,8 +80,27 @@ def test_service_searches_an_index_it_cannot_write(cfg, vault, embedder, reranke
             svc = Service(cfg, store=s, embedder=embedder, reranker=reranker)
             assert svc.search("espresso grinder")[0].path == "projects/espresso.md"
             assert svc.fts_search("tomatoes")[0].path == "projects/garden.md"
-            assert svc.vault_root is not None
+            assert s.get_meta("vault_root") == str(vault.resolve())
     finally:
         home.chmod(0o755)
         for p in home.iterdir():
             p.chmod(0o644)
+
+
+def test_the_server_searches_an_index_built_with_a_tilde_model_path(cfg, store, vault, embedder, reranker):
+    # `puremind serve` and the `connect` entry make a local model path absolute; `index` may store it with ~.
+    embedder.name = "~/models/embedder"
+    index_vault(vault, store, embedder)
+    embedder.name = os.path.expanduser("~/models/embedder")
+    svc = Service(cfg, store=store, embedder=embedder, reranker=reranker)
+    assert svc.search("espresso grinder", rerank=False)[0].path == "projects/espresso.md"
+
+
+def test_an_index_built_at_another_embedder_revision_is_refused(cfg, store, vault, embedder, reranker):
+    from puremind_mac.service import IndexMismatch
+
+    embedder.revision = "rev-a"
+    index_vault(vault, store, embedder)
+    embedder.revision = "rev-b"
+    with pytest.raises(IndexMismatch, match="revision rev-a but revision rev-b"):
+        Service(cfg, store=store, embedder=embedder, reranker=reranker).search("espresso", rerank=False)

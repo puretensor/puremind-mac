@@ -22,7 +22,7 @@ from .chunker import (
     frontmatter_end,
 )
 from .chunker import VERSION as CHUNKER_VERSION
-from .models import Embedder, ModelLoadError
+from .models import Embedder, ModelLoadError, embedder_revision, model_key
 from .store import Store, StoreError
 
 log = logging.getLogger("puremind.index")
@@ -39,6 +39,10 @@ PROBE_TEXT = "pureMind embedder check"
 
 class EmbedderError(RuntimeError):
     """The embedding model could not be loaded or failed. The index is left as it was."""
+
+
+class VaultMismatch(ValueError):
+    """The index belongs to another vault directory. Nothing was changed."""
 
 
 @dataclass
@@ -109,6 +113,11 @@ class _Scan:
     paths: list[Path] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # entries ignored because of their name
     errors: list[str] = field(default_factory=list)  # directories that could not be listed
+    unlisted: list[str] = field(default_factory=list)  # those directories relative to the vault, "" for the vault itself
+
+    def unlisted_holds(self, rel: str) -> bool:
+        """True if the note ``rel`` lies below a directory that could not be listed."""
+        return any(d == "" or rel.startswith(d + "/") for d in self.unlisted)
 
 
 def _scan(vault: Path) -> _Scan:
@@ -119,8 +128,9 @@ def _scan(vault: Path) -> _Scan:
         where = Path(os.fsdecode(exc.filename)) if exc.filename else root
         try:
             where = where.relative_to(root)
+            scan.unlisted.append("" if where == Path(".") else where.as_posix())
         except ValueError:
-            pass
+            scan.unlisted.append("")  # cannot tell where it is: keep every note
         scan.errors.append(f"{_printable(where)}/ (cannot list directory: {exc.strerror})")
 
     for dirpath, dirnames, filenames in os.walk(root, onerror=unreadable):
@@ -409,10 +419,10 @@ def index_vault(
     """Bring the index in line with the vault.
 
     ``rebuild`` embeds every note again, replacing each one's rows in turn, so searches keep
-    finding the old version meanwhile. A new embedding model discards the index first, since
-    vectors from two models cannot be searched together. Notes cut by an earlier chunker are
-    cut and embedded again. ``should_stop`` is polled between notes; once it returns True
-    the run ends early without removing anything.
+    finding the old version meanwhile. A new embedding model, or a new revision of it, discards
+    the index first, since vectors from two models cannot be searched together. Notes cut by an
+    earlier chunker are cut and embedded again. ``should_stop`` is polled between notes; once it
+    returns True the run ends early without removing anything.
     """
     vault = vault.expanduser().resolve()
     if not vault.is_dir():
@@ -421,18 +431,26 @@ def index_vault(
 
     known_root = store.get_meta("vault_root")
     if not rebuild and known_root and not _same_directory(known_root, vault) and store.stats()["files"]:
-        raise ValueError(
+        raise VaultMismatch(
             f"this index belongs to {known_root}, not {vault}; use a different PUREMIND_DB "
             "(or db = in config.toml) for this vault, or run `puremind index --rebuild` if the vault moved"
         )
     known_model = store.get_meta("embedder")
-    changed = known_model is not None and known_model != embedder.name
+    known_rev = store.get_meta("embedder_revision")  # None in an index from 0.1.1, which pinned none
+    revision = embedder_revision(embedder)
+    changed = known_model is not None and (
+        model_key(known_model) != model_key(embedder.name) or (known_rev is not None and known_rev != revision)
+    )
     if changed:
         if store.stats()["files"]:
             _embed(embedder, [PROBE_TEXT])  # a model that cannot run must not cost the user an index
-        log.warning("embedder changed (%s -> %s); rebuilding the index", known_model, embedder.name)
+        log.warning(
+            "embedder changed (%s%s -> %s%s); rebuilding the index",
+            known_model, f" at {known_rev}" if known_rev else "", embedder.name, f" at {revision}" if revision else "",
+        )
         store.clear()
-    store.set_meta("embedder", embedder.name)
+    store.set_meta("embedder", model_key(embedder.name))
+    store.set_meta("embedder_revision", revision)
     store.set_meta("vault_root", str(vault))
 
     scan = _scan(vault)
@@ -447,18 +465,19 @@ def index_vault(
     if not stats.stopped:
         run.flush()
         gone = sorted(set(run.old) - run.seen)
-        if scan.errors:
+        if scan.errors:  # notes below a directory that could not be listed stay; the others are really gone
             many = len(scan.errors)
             stats.removal_skipped = f"{many} director{'y' if many == 1 else 'ies'} could not be read"
+            gone = [rel for rel in gone if not scan.unlisted_holds(rel)]
         elif not scan.paths and run.old and not rebuild:  # a rebuild of an empty vault empties the index
             stats.removal_skipped = (
                 f"no Markdown files were found but the index holds {len(run.old)} "
                 "(is the vault mounted? run `puremind index --rebuild` if it is really empty)"
             )
-        else:
-            for rel in gone:
-                store.delete_file(rel)
-                stats.removed += 1
+            gone = []
+        for rel in gone:
+            store.delete_file(rel)
+            stats.removed += 1
     if (stats.removed or stats.updated) and not store.purge():  # clear() purges by itself
         log.warning(
             "another process was reading the index, so text deleted or replaced in this run stays in "

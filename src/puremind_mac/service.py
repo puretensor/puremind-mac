@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 from .config import Config
 from .models import (
@@ -12,6 +11,9 @@ from .models import (
     Embedder,
     Reranker,
     SentenceTransformerEmbedder,
+    embedder_revision,
+    model_key,
+    model_label,
 )
 from .retrieval import HybridIndex
 from .store import ChunkRow, Store
@@ -65,13 +67,6 @@ class Service:
         self._lock = threading.Lock()
         self._snap = _Snapshot(-1, (), HybridIndex([], None))
 
-    @property
-    def vault_root(self) -> Path | None:
-        if self.cfg.vault:
-            return self.cfg.vault.expanduser().resolve()
-        stored = self.store.get_meta("vault_root")
-        return Path(stored) if stored else None
-
     def _loaded(self) -> _Snapshot:
         """The current snapshot, reloaded from the store if its generation has moved on."""
         with self._lock:
@@ -84,10 +79,17 @@ class Service:
 
     def search(self, query: str, limit: int = 10, rerank: bool = True) -> list[Hit]:
         built_with = self.store.get_meta("embedder")
-        if built_with and built_with != self.embedder.name:
+        built_rev = self.store.get_meta("embedder_revision")  # None in an index from 0.1.1, which pinned none
+        revision = embedder_revision(self.embedder)
+        if built_with and model_key(built_with) != model_key(self.embedder.name):
             raise IndexMismatch(
-                f"the index was built with {built_with} but {self.embedder.name} is configured; "
-                "run `puremind index --rebuild`"
+                f"the index was built with {model_label(built_with)} but {model_label(self.embedder.name)} "
+                "is configured; run `puremind index --rebuild`"
+            )
+        if built_with and built_rev is not None and built_rev != revision:
+            raise IndexMismatch(
+                f"the index was built with {model_label(built_with)} at revision {built_rev or '(none)'} but "
+                f"revision {revision or '(none)'} is configured; run `puremind index --rebuild`"
             )
         snap = self._loaded()
         if not len(snap.index):

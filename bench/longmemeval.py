@@ -456,7 +456,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit:
         questions = questions[: args.limit]
     embedder = SentenceTransformerEmbedder(cfg.embedder, device, args.max_seq, revision=cfg.embedder_revision)
-    reranker = None if args.no_rerank else CrossEncoderReranker(cfg.reranker, device, revision=cfg.reranker_revision)
+    rerank = cfg.rerank and not args.no_rerank  # as `puremind search` decides it
+    reranker = CrossEncoderReranker(cfg.reranker, device, revision=cfg.reranker_revision) if rerank else None
     extra = {"device": device, "max_seq": args.max_seq, "embedder_revision": cfg.embedder_revision,
              "reranker_revision": None if reranker is None else cfg.reranker_revision}
     results = args.out / "retrieval.jsonl"

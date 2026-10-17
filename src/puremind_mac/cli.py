@@ -17,6 +17,7 @@ import shutil
 import signal
 import sqlite3
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -39,7 +40,8 @@ EXIT_INTERRUPTED = 130
 SEARCH_LIMIT_MAX = 50  # the same cap the MCP tool applies (tools.MAX_LIMIT)
 
 # C0 and C1 control characters except tab and newline: a terminal acts on these (escape sequences).
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Also the bidirectional controls, which can make a printed line show its text out of order.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 class CliError(Exception):
@@ -110,28 +112,37 @@ def cmd_index(args, cfg: Config) -> int:
 
 
 def cmd_watch(args, cfg: Config) -> int:
-    from .indexer import index_vault
+    from .indexer import VaultMismatch, index_vault
     from .watcher import watch
 
     vault = _vault(cfg, args.vault_dir)
     svc = _service(dataclasses.replace(cfg, vault=vault))
+    stop = threading.Event()
+    refused: list[VaultMismatch] = []
 
     def run() -> None:  # always called on this thread, one run at a time
-        stats = index_vault(vault, svc.store, svc.embedder)
+        try:
+            stats = index_vault(vault, svc.store, svc.embedder)
+        except VaultMismatch as exc:  # a symlinked vault now names another directory: every run would fail
+            refused.append(exc)
+            stop.set()
+            return
         print(stats.summary(), flush=True)
         for item in stats.skipped:
             print(f"  skipped: {_one_line(item)}", file=sys.stderr, flush=True)
 
     print(f"watching {_one_line(str(vault.resolve()))} (Ctrl-C to stop)", flush=True)
     try:
-        watch(vault, run, delay=args.debounce)
+        watch(vault, run, delay=args.debounce, stop=stop)
     finally:
         svc.store.close()
+    if refused:
+        raise refused[0]
     return 0
 
 
 def cmd_search(args, cfg: Config) -> int:
-    from .tools import format_score, vault_mismatch
+    from .tools import format_score, score_scale, vault_mismatch
 
     query = args.query.strip()
     if not query:
@@ -144,7 +155,7 @@ def cmd_search(args, cfg: Config) -> int:
         hits, scale = svc.fts_search(query, args.limit), "BM25 keyword score"
     else:
         hits = svc.search(query, args.limit, rerank=rerank)
-        scale = "reranker probability from 0 to 1" if rerank else "reciprocal rank fusion value"
+        scale = score_scale(rerank)
     if not hits:
         empty = svc.store.stats()["chunks"] == 0
         print("no results" + ("; the index is empty, run `puremind index`" if empty else ""))
@@ -226,7 +237,7 @@ def cmd_serve(args, cfg: Config) -> int:
 
 
 # Variables a GUI-launched agent cannot see in your shell but the server needs to behave the same.
-CARRIED_NAMES = ("HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE")
+CARRIED_NAMES = ("HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_ENDPOINT")  # what models.py reads
 _PATH_VARIABLES = ("PUREMIND_HOME", "PUREMIND_VAULT", "PUREMIND_DB", "HF_HOME", "HF_HUB_CACHE")
 _MODEL_VARIABLES = ("PUREMIND_EMBED_MODEL", "PUREMIND_RERANK_MODEL")
 
