@@ -612,6 +612,18 @@ def test_cli_exit_codes(home, vault, tmp_path, capsys, fake_models):
         assert excinfo.value.code == 2
 
 
+def test_cli_index_refuses_a_new_model_until_rebuild_is_given(home, vault, capsys, fake_models, embedder):
+    assert run("index", str(vault)) == 0
+    embedder.name = "another-model"
+    capsys.readouterr()
+    assert run("index", str(vault)) == 2
+    err = capsys.readouterr().err
+    assert "error: the index was built with fake-embedder but another-model is configured; nothing was changed" in err
+    assert "hint: run `puremind index --rebuild`" in err
+    assert run("index", "--rebuild", str(vault)) == 0
+    assert "3 added" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "51", "1000", "x", "1.5", ""])
 def test_search_limit_must_be_a_whole_number_from_1_to_50(home, capsys, value):
     with pytest.raises(SystemExit) as excinfo:

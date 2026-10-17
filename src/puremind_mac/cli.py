@@ -99,12 +99,15 @@ def cmd_init(args, cfg: Config) -> int:
 
 
 def cmd_index(args, cfg: Config) -> int:
-    from .indexer import index_vault
+    from .indexer import ModelMismatch, index_vault
 
     vault = _vault(cfg, args.vault_dir)
     cfg = dataclasses.replace(cfg, vault=vault)
     svc = _service(cfg)
-    stats = index_vault(vault, svc.store, svc.embedder, rebuild=args.rebuild)
+    try:
+        stats = index_vault(vault, svc.store, svc.embedder, rebuild=args.rebuild)
+    except ModelMismatch as exc:
+        return _fail(str(exc), "run `puremind index --rebuild` to embed every note again with the configured model")
     print(stats.summary())
     for item in stats.skipped:
         print(f"  skipped: {_one_line(item)}", file=sys.stderr)
@@ -112,18 +115,20 @@ def cmd_index(args, cfg: Config) -> int:
 
 
 def cmd_watch(args, cfg: Config) -> int:
-    from .indexer import VaultMismatch, index_vault
+    from .indexer import ModelMismatch, VaultMismatch, index_vault
     from .watcher import watch
 
     vault = _vault(cfg, args.vault_dir)
     svc = _service(dataclasses.replace(cfg, vault=vault))
     stop = threading.Event()
-    refused: list[VaultMismatch] = []
+    refused: list[ValueError] = []
 
     def run() -> None:  # always called on this thread, one run at a time
         try:
             stats = index_vault(vault, svc.store, svc.embedder)
-        except VaultMismatch as exc:  # a symlinked vault now names another directory: every run would fail
+        except (VaultMismatch, ModelMismatch) as exc:
+            # A symlinked vault that now names another directory, or an index rebuilt for another
+            # model since this watch read its config: every later run would fail the same way.
             refused.append(exc)
             stop.set()
             return
@@ -137,6 +142,12 @@ def cmd_watch(args, cfg: Config) -> int:
     finally:
         svc.store.close()
     if refused:
+        if isinstance(refused[0], ModelMismatch):
+            return _fail(
+                str(refused[0]),
+                "`puremind watch` keeps the model it started with: restart it if the model has changed "
+                "since, or else run `puremind index --rebuild`",
+            )
         raise refused[0]
     return 0
 
@@ -381,7 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("index", help="index the vault (incremental)")
     s.add_argument("vault_dir", nargs="?")
     s.add_argument(
-        "--rebuild", action="store_true", help="embed every note again (searches keep working meanwhile)"
+        "--rebuild", action="store_true", help="embed every note again; needed after changing the embedding model"
     )
     s.set_defaults(fn=cmd_index)
 

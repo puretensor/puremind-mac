@@ -98,7 +98,7 @@ The reranker costs about 0.2 seconds per candidate on a CPU, so with the default
 
 - **Model revisions.** The default models are pinned to `Qwen/Qwen3-Embedding-0.6B` at `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3` and `BAAI/bge-reranker-v2-m3` at `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`. Another model uses its repository's default branch as it was at the first download, and is not refreshed afterwards unless you set a revision or clear the cache.
 - **Model names.** A name is a Hugging Face model id unless it starts with `/`, `./`, `../` or `~`, which mark a local directory. A directory in your working directory is never picked up by accident. Models load with `trust_remote_code` off.
-- **Changing the embedding model** makes the next `puremind index` rebuild the index, since vectors from different models are not comparable. The new model must first load and embed a test passage, so a mistyped name leaves the existing index untouched. The index is then emptied, and searches find nothing until the run finishes. `puremind index --rebuild` with the same model, by contrast, replaces one note at a time, so searches keep working.
+- **Changing the embedding model**, or `embedder_revision`, takes `puremind index --rebuild`, since vectors from different models are not comparable. Until then `puremind index` and `puremind watch` stop with an error and change nothing, and searches are refused. A `puremind watch` keeps the model it started with, so restart it after the change; one left running stops instead of wiping the rebuilt index. With `--rebuild`, the new model must first load and embed a test passage, so a mistyped name leaves the existing index untouched. The index is then emptied, and searches find nothing until the run finishes. `puremind index --rebuild` with the same model, by contrast, replaces one note at a time, so searches keep working.
 - **The reranker window.** 800 characters is the setting the benchmark below was measured with. Raising `rerank_chars` lets the reranker see more of each passage, at the cost of slower searches.
 - **Indexes from 0.1.1 or earlier** are brought up to date by the next `puremind index` or `puremind watch` run, which cuts and embeds every note again. It takes about as long as the first index did, and searches keep working meanwhile.
 
@@ -113,7 +113,7 @@ The index is a second copy of your notes' text. It is created readable only by y
 | Command | What it does |
 |---|---|
 | `puremind init <vault_dir> [--force]` | Writes `config.toml`. |
-| `puremind index [vault_dir] [--rebuild]` | Indexes the vault incrementally; `--rebuild` embeds every note again. |
+| `puremind index [vault_dir] [--rebuild]` | Indexes the vault incrementally; `--rebuild` embeds every note again, and is needed after changing the embedding model. |
 | `puremind watch [vault_dir] [--debounce SECONDS]` | Indexes, then re-indexes when notes change. |
 | `puremind search <query> [--limit N] [--no-rerank] [--lexical-only]` | Searches from the terminal; `--limit` is 1 to 50. |
 | `puremind serve [--no-rerank]` | Runs the MCP server on stdio. Your agent starts this for you. |
