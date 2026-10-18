@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.5 (unreleased)
+## 0.1.5 (2026-10-18)
 
 Faster with large vaults. Measured on Linux with a synthetic vault of 50,000 chunks (20,000 in brackets), against 0.1.4:
 
