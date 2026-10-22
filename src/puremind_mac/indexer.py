@@ -101,6 +101,30 @@ def is_indexable(root: Path, path: Path) -> Path | None:
     return real
 
 
+def open_resolved(path: Path, flags: int) -> int:
+    """Open the already-resolved ``path``, refusing a symlink at ANY component.
+
+    O_NOFOLLOW alone covers only the last component, so an ancestor directory swapped for a
+    symlink after is_indexable() would redirect the open outside the vault. Walk from the
+    file system root one directory descriptor at a time instead.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    dir_flags = os.O_RDONLY | nofollow | getattr(os, "O_DIRECTORY", 0)
+    parts = os.fsencode(path).split(b"/")
+    names = [p for p in parts if p]
+    if not os.path.isabs(path) or not names:
+        raise OSError(errno.EINVAL, "not an absolute file path")
+    dir_fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for name in names[:-1]:
+            nxt = os.open(name, dir_flags, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nxt
+        return os.open(names[-1], flags | nofollow, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _printable(name: str | os.PathLike[str]) -> str:
     """A file name safe to print: bytes that are not valid UTF-8 appear as \\xNN escapes."""
     return os.fsencode(name).decode("utf-8", "backslashreplace")
@@ -198,7 +222,7 @@ def _read_note(path: Path) -> tuple[bytes, os.stat_result]:
     """Bytes and stat of a regular file, read without blocking on a pipe, following a symlink or
     passing the size cap. ``path`` is already resolved (see is_indexable)."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)  # a FIFO swapped in must not hang us
-    fd = os.open(path, flags)
+    fd = open_resolved(path, flags)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
