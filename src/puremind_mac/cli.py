@@ -214,6 +214,66 @@ def cmd_search(args, cfg: Config) -> int:
     return 0
 
 
+def _confirm(question: str) -> bool:
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _print_proposal(p, full: bool) -> None:
+    from . import inbox
+
+    print(f"{p.id}  proposed {inbox.age(p)} ago")
+    print(f"title: {_one_line(p.title)}")
+    if full:
+        print(f"\n{_clean(p.content)}")
+
+
+def cmd_inbox(args, cfg: Config) -> int:
+    """Review the memories agents have proposed: list, show, approve (the only step that writes a note) or reject."""
+    from . import inbox
+
+    try:
+        action = args.inbox_command or "list"
+        if action == "list":
+            pending, unreadable = inbox.list_proposals(cfg.home)
+            for name in unreadable:
+                print(f"warning: {_one_line(name)} in the inbox could not be read; delete it or fix it", file=sys.stderr)
+            if not pending:
+                print("the inbox is empty")
+                return 0
+            print(f"{len(pending)} proposal(s) waiting; `puremind inbox show ID` reads one, `approve ID` keeps it")
+            for p in pending:
+                print(f"{p.id}  {inbox.age(p):>7}  {_one_line(p.title)[:80]}  ({len(p.content):,} characters)")
+            return 0
+        proposal = inbox.find(cfg.home, args.id)
+        if action == "show":
+            _print_proposal(proposal, full=True)
+            return 0
+        if action == "reject":
+            inbox.discard(cfg.home, proposal)
+            print(f"rejected {proposal.id}")
+            return 0
+        vault = _vault(cfg, None)
+        rel = inbox.check_note_path(args.path) if args.path else inbox.default_path(proposal, cfg.inbox_folder)
+        _print_proposal(proposal, full=True)
+        taken = "" if args.path else "; a name that is taken gets a number"
+        print(f"\nwould write: {rel}   (in {_one_line(str(vault.resolve()))}{taken})")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise CliError("approval needs you at a terminal; read the proposal, then pass --yes to approve it")
+            if not _confirm("Write this note?"):
+                print("not written; the proposal stays in the inbox")
+                return 0
+        written = inbox.approve(cfg.home, vault, proposal, args.path, cfg.inbox_folder)
+        print(f"wrote {written}")
+        print("next: `puremind index` makes it searchable (a running `puremind watch` does that by itself).")
+        return 0
+    except inbox.InboxError as exc:
+        raise CliError(str(exc)) from None
+
+
 def _absolute(cfg: Config) -> Config:
     """``cfg`` with every relative path made absolute against the current directory."""
 
@@ -264,6 +324,8 @@ def cmd_serve(args, cfg: Config) -> int:
     cfg = _absolute(cfg)
     if args.no_rerank:
         cfg = dataclasses.replace(cfg, rerank=False)
+    if args.read_only:
+        cfg = dataclasses.replace(cfg, inbox_enabled=False)
     # The agent starts the server in its own project directory, which may hold anything: leave it
     # before any model or library is loaded, so nothing is looked up there.
     private_home(cfg.home)
@@ -391,8 +453,9 @@ def connect_snippet(agent: str, command: str | Sequence[str], env: Mapping[str, 
 def cmd_connect(args, cfg: Config) -> int:
     print(connect_snippet(args.agent, server_command(), carried_env()))
     print(
-        "\npureMind does not edit your agent's config files. The server is read-only: it can search "
-        "and read your vault but cannot write to it."
+        "\npureMind does not edit your agent's config files. The server cannot write to your vault: it can search "
+        "and read it, and an agent can propose a memory, which stays in an inbox until you approve it with "
+        "`puremind inbox`. Add --read-only to the serve command to turn proposals off."
     )
     return 0
 
@@ -439,13 +502,31 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--lexical-only", action="store_true", help="FTS5 keyword search only; loads no models")
     s.set_defaults(fn=cmd_search)
 
-    s = sub.add_parser("serve", help="run the read-only MCP server on stdio")
+    s = sub.add_parser("serve", help="run the MCP server on stdio")
     s.add_argument(
         "--no-rerank", action="store_true",
         help="never load the cross-encoder reranker: about 1.5 GB less memory and faster searches, "
         "less precise ranking",
     )
+    s.add_argument(
+        "--read-only", action="store_true",
+        help="do not offer puremind_propose: the server then has only its three read-only tools",
+    )
     s.set_defaults(fn=cmd_serve)
+
+    inbox_help = "review the memories agents have proposed, and approve or reject them"
+    s = sub.add_parser("inbox", help=inbox_help, description=inbox_help)
+    s.set_defaults(fn=cmd_inbox, inbox_command=None)
+    isub = s.add_subparsers(dest="inbox_command", metavar="{list,show,approve,reject}")
+    isub.add_parser("list", help="list the waiting proposals (the default)")
+    t = isub.add_parser("show", help="read one proposal")
+    t.add_argument("id", help="a proposal id, or the start of one")
+    t = isub.add_parser("approve", help="write a proposal into the vault as a new note")
+    t.add_argument("id", help="a proposal id, or the start of one")
+    t.add_argument("--path", help="note path inside the vault, instead of <folder>/<date>-<title>.md")
+    t.add_argument("--yes", action="store_true", help="do not ask; needed when not run at a terminal")
+    t = isub.add_parser("reject", help="delete a proposal")
+    t.add_argument("id", help="a proposal id, or the start of one")
 
     s = sub.add_parser("connect", help="print the MCP config snippet for an agent")
     s.add_argument("agent", choices=["claude-code", "codex", "cursor"])

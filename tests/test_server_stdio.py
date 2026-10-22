@@ -153,8 +153,12 @@ def test_the_wire_carries_only_json_rpc_and_declares_a_read_only_server(server):
     assert init["serverInfo"]["version"] == __version__
 
     listed = {t["name"]: t for t in client.request("tools/list")["result"]["tools"]}
-    assert set(listed) == {"puremind_search", "puremind_get", "puremind_recent"}
-    for tool in listed.values():
+    assert set(listed) == {"puremind_search", "puremind_get", "puremind_recent", "puremind_propose"}
+    assert listed["puremind_propose"]["annotations"] == {
+        "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False,
+    }
+    for name in ("puremind_search", "puremind_get", "puremind_recent"):
+        tool = listed[name]
         assert tool["annotations"] == {
             "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False,
         }
@@ -180,6 +184,25 @@ def test_the_wire_carries_only_json_rpc_and_declares_a_read_only_server(server):
         assert result.get("structuredContent") is None  # no duplicate payload next to the text
     assert client.close() == 0
     assert client.lines and client.bad == [], client.bad
+
+
+def test_a_proposal_over_the_wire_lands_in_the_inbox_and_never_in_the_vault(server, tmp_path, vault):
+    before = sorted(p.relative_to(vault).as_posix() for p in vault.rglob("*"))
+    client = server()
+    client.start()
+    result = client.call("puremind_propose", title="Grinder", content="Set the grinder to 14.")
+    assert not result.get("isError"), result
+    assert "not in the user's notes" in text_of(result)
+    files = list((tmp_path / "home" / "inbox").glob("*.json"))
+    assert len(files) == 1 and "Set the grinder to 14." in files[0].read_text()
+    assert sorted(p.relative_to(vault).as_posix() for p in vault.rglob("*")) == before
+    again = client.call("puremind_propose", title="Grinder", content="Set the grinder to 14.")
+    assert "already waiting" in text_of(again) and len(list((tmp_path / "home" / "inbox").glob("*.json"))) == 1
+    for arguments, expected in (({"title": "", "content": "x"}, "at least 1"), ({"title": "t", "content": "x" * 20_001}, "at most 20000")):
+        refused = client.call("puremind_propose", **arguments)
+        assert refused["isError"] and expected in text_of(refused)
+    assert client.close() == 0
+    assert client.bad == []
 
 
 def test_the_switch_that_turns_reranking_off_reaches_the_tool_text(server):
@@ -295,7 +318,7 @@ def test_the_mcp_client_sees_tools_annotations_and_a_tool_error(tmp_path, vault)
 
     listed, refused, served = asyncio.run(run())
     assert strays == []
-    assert {t.name for t in listed.tools} == {"puremind_search", "puremind_get", "puremind_recent"}
+    assert {t.name for t in listed.tools} == {"puremind_search", "puremind_get", "puremind_recent", "puremind_propose"}
     assert all(t.annotations is not None for t in listed.tools)
     assert _is_error(refused) and "hidden" in refused.content[0].text
     assert not _is_error(served) and "Ethiopian" in served.content[0].text

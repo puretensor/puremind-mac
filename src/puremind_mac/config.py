@@ -73,6 +73,8 @@ class Config:
     embedder_revision: str | None = DEFAULT_EMBEDDER_REVISION
     reranker_revision: str | None = DEFAULT_RERANKER_REVISION
     rerank: bool = True  # False never loads the reranker: searches then rank by rank fusion alone
+    inbox_enabled: bool = True  # False leaves the MCP server with its three read-only tools
+    inbox_folder: str = "agent-memories"  # where approved proposals become notes, relative to the vault
 
     @property
     def db_path(self) -> Path:
@@ -133,10 +135,13 @@ def _from_file(cfg: Config, data: dict[str, Any], path: Path) -> Config:
             raise ConfigError(f"{path}: {where}{key} must be a whole number of at least 1")
         return value
 
-    models, retr = table("models"), table("retrieval")
+    models, retr, inbox = table("models"), table("retrieval"), table("inbox")
     flag = retr.get("rerank", cfg.rerank)
     if not isinstance(flag, bool):
         raise ConfigError(f"{path}: retrieval.rerank must be true or false")
+    inbox_on = inbox.get("enabled", cfg.inbox_enabled)
+    if not isinstance(inbox_on, bool):
+        raise ConfigError(f"{path}: inbox.enabled must be true or false")
     vault, db = text(data, "vault", ""), text(data, "db", "")
     embedder, embedder_rev = _model_with_revision(
         cfg.embedder, cfg.embedder_revision,
@@ -162,6 +167,8 @@ def _from_file(cfg: Config, data: dict[str, Any], path: Path) -> Config:
         rrf_k=number(retr, "rrf_k", cfg.rrf_k, "retrieval."),
         rerank=flag,
         rerank_chars=number(retr, "rerank_chars", cfg.rerank_chars, "retrieval."),
+        inbox_enabled=inbox_on,
+        inbox_folder=text(inbox, "folder", "inbox.") or cfg.inbox_folder,
     )
 
 
@@ -278,5 +285,12 @@ def render_config(vault: Path, cfg: Config) -> str:
         "# false skips the cross-encoder: less memory and faster searches, less precise ranking.",
         f"rerank = {'true' if cfg.rerank else 'false'}",
         f"rerank_chars = {cfg.rerank_chars}",
+        "",
+        "[inbox]",
+        "# true lets an agent propose a memory (puremind_propose). Nothing reaches the vault until you run",
+        "# `puremind inbox approve`. false leaves the MCP server with its three read-only tools.",
+        f"enabled = {'true' if cfg.inbox_enabled else 'false'}",
+        "# Where approved proposals become notes, relative to the vault.",
+        f"folder = {toml_string(cfg.inbox_folder)}",
     ]
     return "\n".join(lines) + "\n"

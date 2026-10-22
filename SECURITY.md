@@ -12,11 +12,12 @@ We aim to acknowledge a report within three working days and to tell you within 
 
 ## Supported versions
 
-Security fixes go into the latest 0.1.x release. Upgrade to it before reporting.
+Security fixes go into the latest release. Upgrade to it before reporting.
 
 ## Design notes
 
-- **No network service.** The MCP server is read-only and speaks over stdio only. It opens no network port and has no write path to your notes.
+- **No network service.** The MCP server speaks over stdio only and opens no network port. Three of its four tools only read. The fourth, `puremind_propose`, writes one small file into `~/.puremind/inbox/` (mode 0600, outside the vault) and nothing else.
+- **The inbox is the only write path, and a person approves it.** A proposal is capped (200 characters of title, 20,000 of content, 100 waiting), is not indexed or served until approved, and is read with O_NOFOLLOW. `puremind inbox approve` shows the whole proposal, asks at a terminal (or needs `--yes` without one), and then only creates a new note: it opens the vault one directory at a time without following symlinks, refuses hidden, `..` and absolute paths, and never overwrites. It is a review step, not a boundary against an agent that can run shell commands as you: such an agent could pass `--yes`. `puremind serve --read-only` or `enabled = false` under `[inbox]` removes the tool.
 - **What `puremind_get` serves.** Only the notes the indexer reads: regular `.md` and `.markdown` files of at most 2 MiB that, after resolving symlinks, lie inside the vault, outside hidden folders, `node_modules` and `__pycache__`. Absolute paths, `..`, NUL characters and paths over 1,024 characters are refused before the file system is touched, and refusals never contain absolute paths. A path is tried as given and then without surrounding white space, and each spelling must pass every check.
 - **Network use.** The only network access is the one-time download of the two models from Hugging Face, at pinned revisions, which sends your Hugging Face token if one is configured. Once they are cached, models load from the cache and nothing contacts the network. pureMind turns Hugging Face telemetry off unless you have set `HF_HUB_DISABLE_TELEMETRY` yourself. Set `HF_HUB_OFFLINE=1` to forbid downloads altogether. A cached copy that lacks a file the models need is completed by a download, or refused when offline, so a partial copy is never loaded as if it were complete.
 - **Model loading.** A model name is a Hugging Face id unless it starts with `/`, `./`, `../` or `~`, so a directory in the working directory is never loaded by accident. Models load with `trust_remote_code` off, pureMind downloads only safetensors weights (no pickle files), and `puremind serve` runs from the pureMind home directory. `sentence-transformers` 5.6.0 or newer is required because older releases could run code from a local model directory (CVE-2026-68770).

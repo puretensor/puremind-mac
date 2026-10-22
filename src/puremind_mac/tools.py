@@ -1,4 +1,4 @@
-"""Handlers for the three read-only MCP tools.
+"""Handlers for the MCP tools: three that only read, and puremind_propose, which only leaves a proposal.
 
 Each returns plain text. A request that cannot be served raises ToolRefused, whose message is
 short and names no absolute path; the server turns it into a protocol error (isError=true).
@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from . import inbox
 from .indexer import (
     MARKDOWN_SUFFIXES,
     MAX_FILE_BYTES,
@@ -239,3 +240,19 @@ def puremind_recent(service: Service, days: int = 7, limit: int = 20) -> str:
     for r in rows:
         lines.append(f"- {r.path}  ({_when(r.mtime)})  {r.title}")
     return "\n".join(lines) + skipped
+
+
+def puremind_propose(service: Service, title: str, content: str) -> str:
+    """Leave a proposed memory in the inbox. It changes nothing the user has until they approve it."""
+    try:
+        proposal, new = inbox.propose(service.cfg.home, title, content)
+    except inbox.InboxError as exc:
+        raise ToolRefused(str(exc)) from None
+    except OSError:
+        log.warning("puremind_propose could not save the proposal", exc_info=True)
+        raise ToolRefused("the proposal could not be saved") from None
+    state = "saved" if new else "was already waiting"
+    return (
+        f"Proposal {proposal.id} {state}. It is not in the user's notes: the user has to review and approve it "
+        "with `puremind inbox`, and may reject it. Do not treat it as remembered, and do not propose it again."
+    )

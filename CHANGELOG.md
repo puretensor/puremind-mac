@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+A write path, through an inbox you approve.
+
+- New MCP tool `puremind_propose(title, content)`. An agent can propose a memory; it is saved in `~/.puremind/inbox/` and does nothing else. It is not indexed or searchable, and the vault is not touched, until you approve it. At most 200 characters of title, 20,000 of content and 100 waiting proposals; an identical proposal is kept once.
+- New command `puremind inbox` with `list` (the default), `show ID`, `approve ID [--path P] [--yes]` and `reject ID`. Approving shows the proposal, asks at a terminal (without one it needs `--yes`) and creates a new note at `agent-memories/<date>-<title>.md`, or at `--path`. It never overwrites a note or edits one, refuses `..`, hidden and absolute paths, and does not write through a symlink at any level.
+- `puremind serve --read-only`, or `[inbox] enabled = false` in `config.toml`, leaves out `puremind_propose`, so the server has only its three read-only tools. `[inbox] folder` sets where approved notes go. `puremind init --force` keeps both settings.
+- A Homebrew formula in `packaging/homebrew/puremind.rb`, for use from a tap of your own (no public tap yet).
+- README: results by question type for the benchmark (Recall@5 and judged QA for each of the six LongMemEval types).
+- The MCP server's instructions and `puremind connect` now say that the server cannot write to the vault but accepts proposals. The test that listed exactly three tools now lists four.
+
 ## 0.1.6 (2026-10-22)
 
 - `puremind_get` and the indexer now open a note through a chain of directory descriptors that refuse a symlink at every component. Before, only the last component was protected, so a folder swapped for a symlink after the path check could make `puremind_get` serve a file from outside the vault.

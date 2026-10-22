@@ -545,9 +545,11 @@ def test_python_dash_m_runs_the_command_line():
 # ---- the command line
 
 
-def test_parser_has_no_write_commands():
+def test_parser_has_exactly_the_documented_commands():
     sub = next(a for a in cli.build_parser()._actions if a.dest == "command")
-    assert set(sub.choices) == {"init", "index", "watch", "search", "serve", "connect"}
+    assert set(sub.choices) == {"init", "index", "watch", "search", "serve", "connect", "inbox"}
+    inbox = next(a for a in sub.choices["inbox"]._actions if a.dest == "inbox_command")
+    assert set(inbox.choices) == {"list", "show", "approve", "reject"}
 
 
 def test_help_texts_name_the_variable_that_moves_the_home_directory_and_the_limit_range():
