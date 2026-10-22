@@ -36,7 +36,7 @@ CI also runs pip-audit on the dependencies a new install resolves, and the suite
 
 ## Rules
 
-- The MCP server stays read-only. The write path is planned for v0.2 and will arrive with its own design discussion.
+- The MCP server never writes to the vault. An agent can only leave a proposal in the inbox (`puremind_propose`), and only `puremind inbox approve`, run by the user, creates a note. A change that gives an MCP tool any other way to write needs a design discussion first.
 - Keep the retrieval pipeline (BM25 top 50, dense top 50, RRF k=60, rerank over 50 with an 800-character window) unchanged unless a change is backed by a benchmark run.
 - A new third-party import in `src/` needs a dependency in `pyproject.toml`, with a lower bound you have actually run; a test checks this.
 - The version lives only in `src/puremind_mac/__init__.py`. A release bumps it and adds the matching heading to `CHANGELOG.md` in the same commit; a test checks that too.

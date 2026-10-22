@@ -61,16 +61,38 @@ def _listed(service):
 # ---- the server surface
 
 
-def test_server_exposes_exactly_three_read_only_tools(service):
-    assert set(_listed(service)) == {"puremind_search", "puremind_get", "puremind_recent"}
+READ_TOOLS = {"puremind_search", "puremind_get", "puremind_recent"}
 
 
-def test_tools_are_annotated_read_only(service):
-    for tool in _listed(service).values():
+def test_server_exposes_three_read_only_tools_and_the_proposal_tool(service):
+    assert set(_listed(service)) == READ_TOOLS | {"puremind_propose"}
+
+
+def test_the_proposal_tool_can_be_switched_off(service):
+    off = Service(dataclasses.replace(service.cfg, inbox_enabled=False), service.store, service.embedder)
+    assert set(_listed(off)) == READ_TOOLS
+    assert "propos" not in build_server(off).instructions
+
+
+def test_read_tools_are_annotated_read_only(service):
+    for name in READ_TOOLS:
+        tool = _listed(service)[name]
         assert _hint(tool, "readOnlyHint") is True
         assert _hint(tool, "destructiveHint") is False
         assert _hint(tool, "idempotentHint") is True
         assert _hint(tool, "openWorldHint") is False
+
+
+def test_the_proposal_tool_is_annotated_as_writing_only_to_the_inbox(service):
+    tool = _listed(service)["puremind_propose"]
+    assert _hint(tool, "readOnlyHint") is False
+    assert _hint(tool, "destructiveHint") is False
+    assert _hint(tool, "openWorldHint") is False
+    schema = _schema(tool)
+    assert schema["required"] == ["title", "content"]
+    assert schema["properties"]["title"]["maxLength"] == 200
+    assert schema["properties"]["content"]["maxLength"] == 20_000
+    assert "does not write to their notes" in tool.description
 
 
 def test_tool_schemas_defaults_and_bounds(service):
@@ -102,7 +124,9 @@ def test_descriptions_explain_the_score_the_caps_and_the_truncation(service):
 
 
 def test_server_carries_instructions(service):
-    assert "read-only" in build_server(service).instructions
+    text = build_server(service).instructions
+    assert "read-only" in text
+    assert "nothing becomes a note until the user approves it" in text
 
 
 def test_server_calls_through_to_handlers(service, vault):
