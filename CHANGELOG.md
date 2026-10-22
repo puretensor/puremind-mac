@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6 (2026-10-22)
+
+- `puremind_get` and the indexer now open a note through a chain of directory descriptors that refuse a symlink at every component. Before, only the last component was protected, so a folder swapped for a symlink after the path check could make `puremind_get` serve a file from outside the vault.
+
 ## 0.1.5 (2026-10-18)
 
 Faster with large vaults. Measured on Linux with a synthetic vault of 50,000 chunks (20,000 in brackets), against 0.1.4:

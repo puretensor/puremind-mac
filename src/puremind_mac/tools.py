@@ -20,6 +20,7 @@ from .indexer import (
     _excluded_part,
     _same_directory,
     is_indexable,
+    open_resolved,
 )
 from .models import ModelLoadError
 from .service import IndexMismatch, Service
@@ -157,7 +158,7 @@ def _spellings(path: str) -> list[str]:
 def _read_note(path: Path) -> tuple[str, bool]:
     """Up to 4 * MAX_GET_CHARS bytes of the note as text, and whether the file continued beyond them."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    with os.fdopen(os.open(path, flags), "rb") as fh:
+    with os.fdopen(open_resolved(path, flags), "rb") as fh:
         st = os.fstat(fh.fileno())
         if not stat.S_ISREG(st.st_mode):
             raise ToolRefused("not a regular Markdown note")

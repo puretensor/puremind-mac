@@ -530,3 +530,22 @@ def test_tools_never_modify_the_vault(service, vault):
     tools.puremind_get(service, "projects/garden.md")
     tools.puremind_recent(service)
     assert before == {p: p.read_bytes() for p in vault.rglob("*.md")}
+
+
+def test_get_rejects_ancestor_directory_swapped_after_validation(service, vault, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "garden.md").write_text("OUTSIDE_VAULT_CANARY")
+    (vault / "projects").mkdir(exist_ok=True)
+    (vault / "projects" / "garden.md").write_text("inside")
+    original = tools._read_note
+
+    def swap_then_read(path):
+        (vault / "projects").rename(vault / "original-projects")
+        (vault / "projects").symlink_to(outside, target_is_directory=True)
+        return original(path)
+
+    monkeypatch.setattr(tools, "_read_note", swap_then_read)
+    with pytest.raises(tools.ToolRefused):
+        result = tools.puremind_get(service, "projects/garden.md")
+        assert "OUTSIDE_VAULT_CANARY" not in result
