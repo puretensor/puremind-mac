@@ -79,6 +79,24 @@ def test_delete_file_cascades(store):
     assert store.fts_search("one") == []
 
 
+def test_metadata_refresh_changes_only_the_matching_file_stat(store):
+    path = "it's a note.md"
+    put(store, path=path)
+    put(store, path="other.md")
+    chunks, vectors = store.load_index()
+    generation = store.generation()
+    store.update_file_metadata(path, "h1", 200.0, 42)
+    rows = {r.path: r for r in store.list_files()}
+    assert (rows[path].mtime, rows[path].size, rows[path].sha256) == (200.0, 42, "h1")
+    assert (rows["other.md"].mtime, rows["other.md"].size) == (100.0, 10)
+    assert store.load_index()[0] == chunks
+    np.testing.assert_array_equal(store.load_index()[1], vectors)
+    assert store.generation() == generation
+    store.update_file_metadata(path, "stale hash", 300.0, 99)
+    store.update_file_metadata("missing.md", "h1", 300.0, 99)
+    assert {r.path: r for r in store.list_files()} == rows
+
+
 def test_file_with_no_chunks(store):
     put(store, chunks=(), vectors=None)
     assert store.stats() == {"files": 1, "chunks": 0, "vectors": 0}
@@ -393,6 +411,7 @@ def writes_refused(s):
     for call in (
         lambda: s.set_meta("k", "v"),
         lambda: put(s, "c.md"),
+        lambda: s.update_file_metadata("a.md", "h1", 200.0, 42),
         lambda: s.delete_file("a.md"),
         lambda: s.clear(),
     ):

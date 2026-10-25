@@ -1,10 +1,14 @@
 """The inbox: proposals from an agent, and the approval that turns one into a note."""
 
 import dataclasses
+import fcntl
 import io
 import json
 import os
+import select
 import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -40,6 +44,104 @@ def test_the_same_proposal_twice_is_kept_once(home):
     second, new_second = inbox.propose(home, "Grinder", "Set to 14.")
     assert (new_first, new_second) == (True, False) and first == second
     assert len(inbox.list_proposals(home)[0]) == 1
+
+
+@pytest.mark.parametrize("same", [False, True])
+def test_concurrent_processes_deduplicate_and_obey_the_cap(home, same):
+    home.mkdir()
+    (home / "inbox").mkdir()
+    script = """
+import sys, time
+from pathlib import Path
+from puremind_mac import inbox
+inbox.MAX_PENDING = 1
+original = inbox.list_proposals
+def slow_list(home):
+    result = original(home)
+    time.sleep(0.1)
+    return result
+inbox.list_proposals = slow_list
+print('ready', flush=True)
+sys.stdin.readline()
+try:
+    proposal, new = inbox.propose(Path(sys.argv[1]), sys.argv[2], 'content')
+    print(proposal.id, new, flush=True)
+except inbox.InboxError:
+    print('full', flush=True)
+"""
+    children = []
+    try:
+        for n in range(4):
+            children.append(subprocess.Popen(
+                [sys.executable, "-c", script, str(home), "same" if same else f"note {n}"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ))
+        for child in children:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert child.stdout.readline().strip() == "ready"
+        for child in children:
+            child.stdin.write("go\n")
+            child.stdin.flush()
+        results = []
+        for child in children:
+            out, err = child.communicate(timeout=10)
+            assert child.returncode == 0, err
+            results.append(out.strip())
+        pending, unreadable = inbox.list_proposals(home)
+        assert len(pending) == 1 and not unreadable
+        assert results.count(f"{pending[0].id} True") == 1
+        assert results.count(f"{pending[0].id} False" if same else "full") == 3
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_proposing_waits_for_the_sidecar_lock_before_checking_the_inbox(home):
+    made(home)
+    with (home / "inbox" / ".propose.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        script = """
+import sys
+from pathlib import Path
+from puremind_mac import inbox
+original = inbox.list_proposals
+def checked(home):
+    print('checked', flush=True)
+    return original(home)
+inbox.list_proposals = checked
+print('ready', flush=True)
+inbox.propose(Path(sys.argv[1]), 'other', 'content')
+"""
+        child = subprocess.Popen(
+            [sys.executable, "-c", script, str(home)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert child.stdout.readline().strip() == "ready"
+            assert not select.select([child.stdout], [], [], 0.2)[0]
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            out, err = child.communicate(timeout=10)
+            assert child.returncode == 0 and out.strip() == "checked", err
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_failed_creation_releases_the_lock(home, monkeypatch):
+    def broken(*args):
+        raise OSError("write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(inbox.json, "dump", broken)
+        with pytest.raises(OSError, match="write failed"):
+            made(home)
+    with (home / "inbox" / ".propose.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert inbox.list_proposals(home) == ([], [])
+    assert made(home)
 
 
 @pytest.mark.parametrize(

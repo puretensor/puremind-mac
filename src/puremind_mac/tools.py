@@ -30,6 +30,7 @@ from .store import Store
 log = logging.getLogger("puremind.tools")
 
 MAX_LIMIT = 50
+MAX_QUERY_CHARS = 4096
 MAX_GET_CHARS = 200_000
 MAX_RECENT_LIMIT = 200
 MAX_RECENT_DAYS = 3650
@@ -86,6 +87,8 @@ _MISMATCH_NOTE = (
 
 
 def puremind_search(service: Service, query: str, limit: int = 10) -> str:
+    if query and len(query) > MAX_QUERY_CHARS:
+        raise ToolRefused(f"the query is longer than {MAX_QUERY_CHARS} characters")
     query = (query or "").strip()
     if not query:
         raise ToolRefused("query is empty")
