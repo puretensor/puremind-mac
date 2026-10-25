@@ -370,13 +370,26 @@ class Store:
 
         FTS5 only marks a deleted row's terms as deleted and drops them when it merges the parts
         of its index, so the parts are merged now; secure_delete zeroes the pages this frees.
-        Returns what ``checkpoint`` returns.
+        Returns what ``checkpoint`` returns. Clearing the debt afterwards may leave metadata
+        in the -wal file; a concurrent write keeps the debt for the next purge.
         """
         self._check_writable()
         with self.db:
             self.db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('optimize')")
-            self.db.execute("DELETE FROM meta WHERE key = 'purge_pending'")
-        return self.checkpoint()
+            generation = self.generation()
+        if not self.checkpoint():
+            return False
+        with self.db:
+            # A writer after compaction owes another purge, even if the checkpoint included its pages.
+            self.db.execute(
+                "DELETE FROM meta WHERE key = 'purge_pending' "
+                "AND COALESCE((SELECT value FROM meta WHERE key = 'generation'), '0') = ?",
+                (str(generation),),
+            )
+        return True
+
+    def _owe_purge(self) -> None:
+        self.db.execute("INSERT INTO meta(key, value) VALUES ('purge_pending', '1') ON CONFLICT(key) DO NOTHING")
 
     def defer_purge(self) -> bool:
         """Note in the index that ``purge`` is still owed, so that a process that stops before
@@ -385,7 +398,7 @@ class Store:
         holds their words. Returns what ``checkpoint`` returns."""
         self._check_writable()
         with self.db:
-            self.db.execute("INSERT INTO meta(key, value) VALUES ('purge_pending', '1') ON CONFLICT(key) DO NOTHING")
+            self._owe_purge()
         return self.checkpoint()
 
     def purge_pending(self) -> bool:
@@ -453,7 +466,8 @@ class Store:
         if chunks and (vectors is None or len(vectors) != len(chunks)):
             raise ValueError("vectors must have one row per chunk")
         with self.db:
-            self.db.execute("DELETE FROM files WHERE path = ?", (path,))
+            if self.db.execute("DELETE FROM files WHERE path = ?", (path,)).rowcount:
+                self._owe_purge()
             self.db.execute(
                 "INSERT INTO files(path, sha256, mtime, size, title, indexed_at, chunker) VALUES (?,?,?,?,?,?,?)",
                 (path, sha256, mtime, size, title, time.time(), chunker),
@@ -482,21 +496,28 @@ class Store:
     def delete_file(self, path: str) -> None:
         self._check_writable()
         with self.db:
-            self.db.execute("DELETE FROM files WHERE path = ?", (path,))
+            if self.db.execute("DELETE FROM files WHERE path = ?", (path,)).rowcount:
+                self._owe_purge()
             self._bump()
 
-    def clear(self) -> None:
-        """Remove every note, and every trace of their text from the file. Searches meanwhile find nothing."""
+    def clear(self, *, vault_root: str | None = None) -> None:
+        """Remove every note and adopt ``vault_root`` in one transaction, then purge their text."""
         self._check_writable()
         with self.db:
             self.db.execute("DELETE FROM files")
             self.db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")  # empties the keyword index outright
-            self.db.execute("DELETE FROM meta WHERE key = 'purge_pending'")
+            self._owe_purge()
+            if vault_root is not None:
+                self.db.execute(
+                    "INSERT INTO meta(key, value) VALUES ('vault_root', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (vault_root,),
+                )
             self._bump()
         if self.path != ":memory:":
             with self.db:  # no transaction is open here, which VACUUM needs
                 self.db.execute("VACUUM")  # also drops pages an earlier version freed without zeroing
-            self.checkpoint()
+        self.purge()
 
     def recent(self, since: float, limit: int) -> list[FileRow]:
         rows = self.db.execute(

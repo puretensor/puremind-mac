@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import logging
 import os
@@ -10,6 +11,7 @@ import re
 import sqlite3
 import stat
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,7 +48,7 @@ PROBE_TEXT = "pureMind embedder check"
 
 
 class EmbedderError(RuntimeError):
-    """The embedding model could not be loaded or failed. The index is left as it was."""
+    """The embedding model could not be loaded or failed."""
 
 
 class VaultMismatch(ValueError):
@@ -454,6 +456,23 @@ def _same_directory(known: str, vault: Path) -> bool:
         return False
 
 
+@contextmanager
+def _index_lock(store: Store):
+    if store.path == ":memory:":
+        yield
+        return
+    path = str(Path(store.path).resolve()) + ".lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise StoreError(f"another index run holds {path}; try again after it finishes") from None
+        yield
+    finally:
+        os.close(fd)  # keep the sidecar: unlinking it would let writers lock different inodes
+
+
 def index_vault(
     vault: Path,
     store: Store,
@@ -468,23 +487,39 @@ def index_vault(
     ``rebuild`` embeds every note again, replacing each one's rows in turn, so searches keep
     finding the old version meanwhile. A new embedding model, revision or configuration is refused
     with ``ModelMismatch`` unless ``rebuild`` is set, and then discards the index first, since
-    vectors from two models cannot be searched together. Notes cut by an earlier chunker are cut
+    vectors from two models cannot be searched together. Switching vaults also discards the old
+    rows before recording the new root, in one transaction. Overlapping runs on the same database
+    are refused until this run finishes. Notes cut by an earlier chunker are cut
     and embedded again. ``should_stop`` is polled between notes; once it returns True the run
     ends early without removing anything.
 
     Text a run removes or replaces leaves the tables at once. Its words leave the keyword index
     when the index is compacted (``Store.purge``), which takes about half a second at 50,000
     chunks. With ``purge`` the run compacts at its end, also paying a compaction an earlier run
-    put off; without it, the run only records that one is owed (``stats.purge_deferred``) and the
+    put off; without it, the debt recorded with each write stays (``stats.purge_deferred``) and the
     caller pays it later, as ``puremind watch`` does.
     """
+    with _index_lock(store):
+        return _index_vault(vault, store, embedder, rebuild, should_stop=should_stop, purge=purge)
+
+
+def _index_vault(
+    vault: Path,
+    store: Store,
+    embedder: Embedder,
+    rebuild: bool,
+    *,
+    should_stop: Callable[[], bool] | None,
+    purge: bool,
+) -> IndexStats:
     vault = vault.expanduser().resolve()
     if not vault.is_dir():
         raise NotADirectoryError(f"vault directory not found: {vault}")
     stats = IndexStats()
 
     known_root = store.get_meta("vault_root")
-    if not rebuild and known_root and not _same_directory(known_root, vault) and store.stats()["files"]:
+    root_changed = known_root is not None and not _same_directory(known_root, vault)
+    if not rebuild and root_changed and store.stats()["files"]:
         raise VaultMismatch(
             f"this index belongs to {known_root}, not {vault}; use a different PUREMIND_DB "
             "(or db = in config.toml) for this vault, or run `puremind index --rebuild` if the vault moved"
@@ -516,7 +551,8 @@ def index_vault(
             "embedding model or configuration changed (%s%s -> %s%s); rebuilding the index",
             known_model, f" at {known_rev}" if known_rev else "", embedder.name, f" at {revision}" if revision else "",
         )
-        store.clear()
+    if changed or root_changed:
+        store.clear(vault_root=str(vault))
     store.set_meta("embedder", model_key(embedder.name))
     store.set_meta("embedder_revision", revision)
     store.set_meta("embedding_config", config)
@@ -548,14 +584,12 @@ def index_vault(
             store.delete_file(rel)
             stats.removed += 1
     emptied = True
-    if stats.removed or stats.updated:  # clear() purges by itself
+    if store.purge_pending():
         if purge:
             emptied = store.purge()
         else:
             emptied = store.defer_purge()
             stats.purge_deferred = True
-    elif purge and store.purge_pending():  # owed by a `puremind watch` that stopped before paying it
-        emptied = store.purge()
     if not emptied:
         log.warning(
             "another process was reading the index, so text deleted or replaced in this run stays in "

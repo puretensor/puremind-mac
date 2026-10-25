@@ -14,6 +14,9 @@ A write path, through an inbox you approve.
 - An unchanged note whose mtime or size moved (an identical save, a sync tool) now has them updated without being embedded again, so `puremind_recent` orders it correctly.
 - `puremind_propose` holds a lock across the duplicate check, the 100-proposal cap and the file creation, so two agents proposing at once can no longer pass the cap or save the same proposal twice.
 - The MCP server's instructions and `puremind connect` now say that the server cannot write to the vault but accepts proposals. The test that listed exactly three tools now lists four.
+- Index runs hold a process lock beside the database until they finish. An overlapping `puremind index` or `puremind watch` run is refused with a clear message, so a watch on an old model can no longer write its vectors into an index rebuilt for another model.
+- Rebuilding for another vault clears the old rows and records the new root in one transaction before indexing its notes. If embedding fails, searches no longer return the old vault's text labelled as the new vault; results stay empty until new notes are indexed.
+- Replacing or deleting a note records the cleanup owed in the same transaction. A run that crashes leaves that record for the next run, and compaction keeps it until the WAL checkpoint succeeds, including when a reader holds the log open.
 
 ## 0.1.6 (2026-10-22)
 
