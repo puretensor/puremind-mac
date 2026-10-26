@@ -99,6 +99,7 @@ def test_tool_schemas_defaults_and_bounds(service):
     tools_ = _listed(service)
     s = _schema(tools_["puremind_search"])
     assert s["required"] == ["query"] and s["properties"]["limit"]["default"] == 10
+    assert s["properties"]["query"]["maxLength"] == tools.MAX_QUERY_CHARS == 4096
     assert (s["properties"]["limit"]["minimum"], s["properties"]["limit"]["maximum"]) == (1, tools.MAX_LIMIT)
     r = _schema(tools_["puremind_recent"])["properties"]
     assert r["days"]["default"] == 7 and r["limit"]["default"] == 20
@@ -147,6 +148,32 @@ def test_server_turns_a_refusal_into_a_tool_error(service, vault):
 
 
 # ---- search
+
+
+@pytest.mark.parametrize("query", ["x" * 4097, " " * 4096 + "x", "é" * 4097])
+def test_long_queries_are_refused_before_search_without_echoing_them(service, monkeypatch, query):
+    def unexpected(*args, **kwargs):
+        pytest.fail("an oversized query reached search")
+
+    monkeypatch.setattr(service, "search", unexpected)
+    assert refusal(tools.puremind_search, service, query) == "the query is longer than 4096 characters"
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(build_server(service).call_tool("puremind_search", {"query": query}))
+    assert query not in str(excinfo.value) and len(str(excinfo.value)) < 1000
+
+
+def test_a_query_at_the_character_limit_is_accepted(service, monkeypatch):
+    seen = []
+
+    def search(query, **kwargs):
+        seen.append(query)
+        return []
+
+    monkeypatch.setattr(service, "search", search)
+    query = "é" * tools.MAX_QUERY_CHARS
+    assert "No results" in tools.puremind_search(service, query)
+    asyncio.run(build_server(service).call_tool("puremind_search", {"query": query}))
+    assert seen == [query, query]
 
 
 def test_search_returns_path_heading_and_score(service, vault):

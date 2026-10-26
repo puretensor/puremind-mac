@@ -470,6 +470,15 @@ class Store:
                 )
             self._bump()
 
+    def update_file_metadata(self, path: str, sha256: str, mtime: float, size: int) -> None:
+        """Refresh an unchanged note's stat only while its indexed content still matches."""
+        self._check_writable()
+        with self.db:
+            self.db.execute(
+                "UPDATE files SET mtime = ?, size = ? WHERE path = ? AND sha256 = ?",
+                (mtime, size, path, sha256),
+            )
+
     def delete_file(self, path: str) -> None:
         self._check_writable()
         with self.db:

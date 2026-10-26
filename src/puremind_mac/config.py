@@ -277,6 +277,7 @@ def render_config(vault: Path, cfg: Config) -> str:
         '# "auto" picks mps on Apple Silicon, cuda if present, else cpu.',
         f"device = {toml_string(cfg.device)}",
         "# Tokens per chunk the embedder reads; a chunk is at most 2,048 characters.",
+        "# Changing it takes `puremind index --rebuild`.",
         f"embed_max_seq = {cfg.embed_max_seq}",
         "",
         "[retrieval]",

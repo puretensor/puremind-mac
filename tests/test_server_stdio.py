@@ -164,6 +164,7 @@ def test_the_wire_carries_only_json_rpc_and_declares_a_read_only_server(server):
         }
         assert not tool.get("outputSchema")
     search = listed["puremind_search"]["inputSchema"]["properties"]
+    assert search["query"]["maxLength"] == 4096
     assert (search["limit"]["minimum"], search["limit"]["maximum"], search["limit"]["default"]) == (1, 50, 10)
     recent = listed["puremind_recent"]["inputSchema"]["properties"]
     assert (recent["days"]["minimum"], recent["days"]["maximum"]) == (1, 3650)
@@ -216,6 +217,7 @@ def test_the_switch_that_turns_reranking_off_reaches_the_tool_text(server):
 
 REFUSED = [
     ("puremind_search", {"query": "   "}, "query is empty"),
+    ("puremind_search", {"query": "x" * 4097}, "4096"),
     ("puremind_get", {"path": "../outside.md"}, "hidden"),
     ("puremind_get", {"path": ".private/diary.md"}, "hidden"),
     ("puremind_get", {"path": "/etc/passwd"}, "relative to the vault"),
@@ -236,6 +238,7 @@ def test_refusals_are_protocol_errors_without_absolute_paths(server, tmp_path):
         assert result["isError"] is True, (name, arguments, result)
         assert expected in message, (name, arguments, message)
         assert str(tmp_path) not in message and "Traceback" not in message, message
+        assert "x" * 4097 not in message and len(message) < 2000
     assert client.close() == 0
 
 

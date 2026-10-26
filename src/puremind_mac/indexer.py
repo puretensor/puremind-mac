@@ -22,7 +22,15 @@ from .chunker import (
     frontmatter_end,
 )
 from .chunker import VERSION as CHUNKER_VERSION
-from .models import Embedder, ModelLoadError, embedder_revision, model_key, model_label
+from .models import (
+    Embedder,
+    ModelLoadError,
+    embedder_revision,
+    embedding_config,
+    embedding_config_label,
+    model_key,
+    model_label,
+)
 from .store import Store, StoreError
 
 log = logging.getLogger("puremind.index")
@@ -46,7 +54,7 @@ class VaultMismatch(ValueError):
 
 
 class ModelMismatch(ValueError):
-    """The index was built with another embedding model or revision, and no rebuild was asked for.
+    """The index was built with another embedding model, revision or configuration, and no rebuild was asked for.
     Nothing was changed."""
 
 
@@ -285,9 +293,15 @@ class _Run:
         # embedded again, and none cut by an earlier chunker.
         current = set() if every else store.chunked_with(CHUNKER_VERSION)
         self.keep = {rel: digest for rel, digest in self.old.items() if rel in current}
+        self.stat = {row.path: (row.mtime, row.size) for row in store.list_files()}
         self.seen: set[str] = set()
         self.queue: list[_Job] = []
         self.queued = 0
+
+    def refresh_stat(self, rel: str, digest: str, st: os.stat_result) -> None:
+        """Keep an unchanged note's mtime and size current for ``puremind_recent``, writing only when they moved."""
+        if self.stat.get(rel) != (st.st_mtime, st.st_size):
+            self.store.update_file_metadata(rel, digest, st.st_mtime, st.st_size)
 
     def fail(self, rel: str, why: str) -> None:
         self.stats.skipped.append(f"{rel} ({why})")
@@ -332,6 +346,7 @@ class _Run:
         self.seen.add(rel)
         digest = hashlib.sha256(raw).hexdigest()
         if self.keep.get(rel) == digest:
+            self.refresh_stat(rel, digest, st)
             self.stats.unchanged += 1
             return
         try:
@@ -398,6 +413,7 @@ class _Run:
                 if digest == job.digest:
                     break
                 if self.keep.get(job.rel) == digest:
+                    self.refresh_stat(job.rel, digest, st)
                     self.stats.unchanged += 1  # edited back to the indexed text
                     return
                 if job.attempt >= RECHECK_ATTEMPTS:
@@ -450,7 +466,7 @@ def index_vault(
     """Bring the index in line with the vault.
 
     ``rebuild`` embeds every note again, replacing each one's rows in turn, so searches keep
-    finding the old version meanwhile. A new embedding model, or a new revision of it, is refused
+    finding the old version meanwhile. A new embedding model, revision or configuration is refused
     with ``ModelMismatch`` unless ``rebuild`` is set, and then discards the index first, since
     vectors from two models cannot be searched together. Notes cut by an earlier chunker are cut
     and embedded again. ``should_stop`` is polled between notes; once it returns True the run
@@ -476,23 +492,34 @@ def index_vault(
     known_model = store.get_meta("embedder")
     known_rev = store.get_meta("embedder_revision")  # None in an index from 0.1.1, which pinned none
     revision = embedder_revision(embedder)
-    changed = known_model is not None and (
+    config = embedding_config(embedder)
+    known_config = store.get_meta("embedding_config")  # None in an index built before the window was recorded
+    model_changed = known_model is not None and (
         model_key(known_model) != model_key(embedder.name) or (known_rev is not None and known_rev != revision)
     )
+    config_changed = known_model is not None and known_config is not None and known_config != config
+    changed = model_changed or config_changed
     if changed and store.stats()["files"]:
         if not rebuild:  # else a `watch` left on the old config and a fresh `index` wipe each other in turn
-            built = model_label(known_model) + (f" at revision {known_rev}" if known_rev else "")
-            wanted = model_label(embedder.name) + (f" at revision {revision}" if revision else "")
-            raise ModelMismatch(f"the index was built with {built} but {wanted} is configured; nothing was changed")
+            if model_changed:  # the larger change; a new window alongside it needs the same rebuild
+                built = model_label(known_model) + (f" at revision {known_rev}" if known_rev else "")
+                wanted = model_label(embedder.name) + (f" at revision {revision}" if revision else "")
+                raise ModelMismatch(f"the index was built with {built} but {wanted} is configured; nothing was changed")
+            raise ModelMismatch(
+                f"the index was built with another embedding configuration ({embedding_config_label(known_config)}, "
+                f"but {embedding_config_label(config)} is configured); run `puremind index --rebuild`; "
+                "nothing was changed"
+            )
         _embed(embedder, [PROBE_TEXT])  # a model that cannot run must not cost the user an index
     if changed:
         log.warning(
-            "embedder changed (%s%s -> %s%s); rebuilding the index",
+            "embedding model or configuration changed (%s%s -> %s%s); rebuilding the index",
             known_model, f" at {known_rev}" if known_rev else "", embedder.name, f" at {revision}" if revision else "",
         )
         store.clear()
     store.set_meta("embedder", model_key(embedder.name))
     store.set_meta("embedder_revision", revision)
+    store.set_meta("embedding_config", config)
     store.set_meta("vault_root", str(vault))
 
     scan = _scan(vault)

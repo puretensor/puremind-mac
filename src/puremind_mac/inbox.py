@@ -9,6 +9,7 @@ creates: it never overwrites or edits an existing file, and it refuses to follow
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import re
@@ -128,35 +129,38 @@ def propose(home: Path, title: str, content: str) -> tuple[Proposal, bool]:
     root = inbox_dir(home)
     _private_dir(home, create=True)
     _private_dir(root, create=True)
-    pending, unreadable = list_proposals(home)
-    for p in pending:
-        if p.title == title and p.content == content:
-            return p, False
-    if len(pending) + len(unreadable) >= MAX_PENDING:
-        raise InboxError(
-            f"the inbox already holds {MAX_PENDING} proposals; ask the user to review them with `puremind inbox`"
-        )
-    now = datetime.now(UTC)
-    for _ in range(8):
-        pid = f"{now:%Y%m%d}-{secrets.token_hex(3)}"
-        proposal = Proposal(pid, now.strftime("%Y-%m-%dT%H:%M:%SZ"), title, content)
-        try:
-            fd = os.open(root / f"{pid}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        except FileExistsError:
-            continue
-        # Written in place: a reader that meets the half-written file counts it as unreadable, and
-        # the writer is a short-lived server process that holds the whole text already.
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(proposal.__dict__, fh)
-        except BaseException:
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(root / ".propose.lock", flags, 0o600), "a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        pending, unreadable = list_proposals(home)
+        for p in pending:
+            if p.title == title and p.content == content:
+                return p, False
+        if len(pending) + len(unreadable) >= MAX_PENDING:
+            raise InboxError(
+                f"the inbox already holds {MAX_PENDING} proposals; ask the user to review them with `puremind inbox`"
+            )
+        now = datetime.now(UTC)
+        for _ in range(8):
+            pid = f"{now:%Y%m%d}-{secrets.token_hex(3)}"
+            proposal = Proposal(pid, now.strftime("%Y-%m-%dT%H:%M:%SZ"), title, content)
             try:
-                os.unlink(root / f"{pid}.json")
-            except OSError:
-                pass
-            raise
-        return proposal, True
-    raise InboxError("could not save the proposal; try again")
+                fd = os.open(root / f"{pid}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            except FileExistsError:
+                continue
+            # Written in place: a reader that meets the half-written file counts it as unreadable, and
+            # the writer is a short-lived server process that holds the whole text already.
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(proposal.__dict__, fh)
+            except BaseException:
+                try:
+                    os.unlink(root / f"{pid}.json")
+                except OSError:
+                    pass
+                raise
+            return proposal, True
+        raise InboxError("could not save the proposal; try again")
 
 
 def find(home: Path, ref: str) -> Proposal:

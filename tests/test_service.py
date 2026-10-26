@@ -96,6 +96,30 @@ def test_the_server_searches_an_index_built_with_a_tilde_model_path(cfg, store, 
     assert svc.search("espresso grinder", rerank=False)[0].path == "projects/espresso.md"
 
 
+def test_search_refuses_a_changed_embedding_window(service, vault, monkeypatch):
+    from puremind_mac.service import IndexMismatch
+
+    service.embedder.max_seq = 2048
+    index_vault(vault, service.store, service.embedder)
+    service.embedder.max_seq = 1024
+
+    def unexpected(query):
+        pytest.fail("an incompatible query reached the embedder")
+
+    monkeypatch.setattr(service.embedder, "embed_query", unexpected)
+    with pytest.raises(
+        IndexMismatch, match=r"embedding configuration \(embed_max_seq 2048, but embed_max_seq 1024 is configured\).*rebuild"
+    ):
+        service.search("espresso", rerank=False)
+
+
+def test_search_accepts_an_index_that_never_recorded_the_window(service, vault):
+    index_vault(vault, service.store, service.embedder)
+    with service.store.db:
+        service.store.db.execute("DELETE FROM meta WHERE key = 'embedding_config'")
+    assert service.search("espresso", rerank=False)
+
+
 def test_an_index_built_at_another_embedder_revision_is_refused(cfg, store, vault, embedder, reranker):
     from puremind_mac.service import IndexMismatch
 

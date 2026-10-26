@@ -51,11 +51,21 @@ def test_second_index_is_a_no_op_and_embeds_nothing(vault, store, embedder):
     assert embedder.texts_embedded == embedded
 
 
-def test_touching_without_changing_content_does_not_reindex(vault, store, embedder):
+def test_touching_without_changing_content_refreshes_recent_without_reembedding(vault, store, embedder, service):
     index_vault(vault, store, embedder)
+    before = embedder.texts_embedded
+    chunks, vectors = store.load_index()
     p = vault / "projects" / "garden.md"
-    p.write_text(p.read_text())
+    touched = time.time() + 60
+    os.utime(p, (touched, touched))
     assert index_vault(vault, store, embedder).unchanged == 3
+    row = store.recent(0, 1)[0]
+    assert (row.path, row.mtime, row.size) == ("projects/garden.md", p.stat().st_mtime, p.stat().st_size)
+    assert embedder.texts_embedded == before and store.load_index()[0] == chunks
+    np.testing.assert_array_equal(store.load_index()[1], vectors)
+    from puremind_mac.tools import puremind_recent
+
+    assert puremind_recent(service).splitlines()[1].startswith("- projects/garden.md")
 
 
 def test_only_changed_file_is_reembedded(vault, store, embedder):
@@ -546,10 +556,85 @@ def test_an_index_without_a_recorded_revision_is_kept(vault, store, embedder):
     assert index_vault(vault, store, embedder).unchanged == 3
 
 
+def test_a_changed_embedding_window_requires_rebuild(vault, store, embedder):
+    embedder.max_seq = 2048
+    index_vault(vault, store, embedder)
+    fingerprint = store.get_meta("embedding_config")
+    assert '"embed_max_seq": 2048' in fingerprint
+    before = embedder.texts_embedded
+    embedder.max_seq = 1024
+    with pytest.raises(
+        ModelMismatch, match=r"embedding configuration \(embed_max_seq 2048, but embed_max_seq 1024 is configured\).*rebuild"
+    ):
+        index_vault(vault, store, embedder)
+    assert store.get_meta("embedding_config") == fingerprint
+    assert store.stats()["files"] == 3 and embedder.texts_embedded == before
+    stats = index_vault(vault, store, embedder, rebuild=True)
+    assert (stats.added, stats.unchanged) == (3, 0)
+    assert embedder.texts_embedded == before + stats.chunks + 1  # probe before clearing
+    assert index_vault(vault, store, embedder).unchanged == 3
+
+
+def test_a_new_model_with_a_new_window_is_reported_as_a_model_change(vault, store, embedder):
+    embedder.max_seq = 2048
+    index_vault(vault, store, embedder)
+    embedder.name, embedder.max_seq = "another-model", 1024
+    with pytest.raises(ModelMismatch, match="built with fake-embedder but another-model is configured; nothing was"):
+        index_vault(vault, store, embedder)
+    assert store.get_meta("embedder") == "fake-embedder" and store.stats()["files"] == 3
+
+
+def test_an_index_that_never_recorded_the_window_adopts_it(vault, store, embedder):
+    embedder.max_seq = 2048
+    index_vault(vault, store, embedder)
+    fingerprint = store.get_meta("embedding_config")
+    with store.db:
+        store.db.execute("DELETE FROM meta WHERE key = 'embedding_config'")
+    before = embedder.texts_embedded
+    assert index_vault(vault, store, embedder).unchanged == 3  # upgrading must not force a rebuild
+    assert embedder.texts_embedded == before
+    assert store.get_meta("embedding_config") == fingerprint
+
+
+def test_unchanged_notes_write_their_stat_only_when_it_moved(vault, store, embedder, monkeypatch):
+    index_vault(vault, store, embedder)
+    calls = []
+    real = store.update_file_metadata
+    monkeypatch.setattr(store, "update_file_metadata", lambda *a: calls.append(a[0]) or real(*a))
+    assert index_vault(vault, store, embedder).unchanged == 3
+    assert calls == []
+    rel = min(store.file_hashes())
+    note = vault / rel
+    os.utime(note, (note.stat().st_atime, note.stat().st_mtime + 60))
+    assert index_vault(vault, store, embedder).unchanged == 3
+    assert calls == [rel]
+
+
 def test_a_local_model_path_spelled_with_a_tilde_matches_its_absolute_form(vault, store, embedder):
     index_vault(vault, store, _Wrapped(embedder, name="~/models/embedder"))
     stats = index_vault(vault, store, _Wrapped(embedder, name=os.path.expanduser("~/models/embedder")))
     assert stats.unchanged == stats.scanned == 3  # the same model: nothing is cleared or embedded again
+
+
+def test_a_failed_window_change_rebuild_preserves_the_index(vault, store, embedder, monkeypatch):
+    embedder.max_seq = 2048
+    index_vault(vault, store, embedder)
+    fingerprint = store.get_meta("embedding_config")
+    chunks, vectors = store.load_index()
+    embedder.max_seq = 1024
+    monkeypatch.setattr(embedder, "embed_documents", _boom)
+    with pytest.raises(EmbedderError, match="could not load the model"):
+        index_vault(vault, store, embedder, rebuild=True)
+    assert store.get_meta("embedding_config") == fingerprint
+    assert store.load_index()[0] == chunks
+    np.testing.assert_array_equal(store.load_index()[1], vectors)
+
+
+def test_an_empty_index_can_adopt_the_embedding_config(vault, store, embedder):
+    store.set_meta("embedder", embedder.name)
+    embedder.max_seq = 1024
+    assert index_vault(vault, store, embedder).added == 3
+    assert store.get_meta("embedding_config") == '{"embed_max_seq": 1024}'
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads everything")
@@ -691,9 +776,13 @@ def test_a_note_edited_back_to_the_indexed_text_needs_no_update(vault, store, em
 
     def restore(texts):
         note.write_text(original)
+        touched = time.time() + 60
+        os.utime(note, (touched, touched))
 
     stats = index_vault(vault, store, _Wrapped(embedder, restore))
     assert (stats.updated, stats.unchanged) == (0, 3)
+    row = store.recent(0, 1)[0]
+    assert (row.path, row.mtime, row.size) == ("projects/garden.md", note.stat().st_mtime, note.stat().st_size)
 
 
 # ---- bounded work per note

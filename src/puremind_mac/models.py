@@ -128,6 +128,22 @@ def embedder_revision(embedder: object) -> str:
     return getattr(embedder, "revision", None) or ""
 
 
+def embedding_config(embedder: object) -> str:
+    """Fingerprint of vector-affecting settings, alongside the model and revision metadata."""
+    return json.dumps({"embed_max_seq": getattr(embedder, "max_seq", None)}, sort_keys=True)
+
+
+def embedding_config_label(config: str | None) -> str:
+    """The settings an ``embedding_config`` fingerprint records, for messages: ``embed_max_seq 2048``."""
+    try:
+        values = json.loads(config) if config else None
+    except ValueError:
+        values = None
+    if not isinstance(values, dict) or not values:
+        return "an unrecorded configuration"
+    return ", ".join(f"{key} {'(unset)' if value is None else value}" for key, value in sorted(values.items()))
+
+
 def _offline_switch() -> str | None:
     """The Hugging Face offline variable that is set, if any."""
     for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
@@ -350,6 +366,10 @@ class SentenceTransformerEmbedder:
         # fast tokenizer raises "Already borrowed" when two threads use it, and devices such as mps
         # are not safe for concurrent forward passes on one model.
         self._busy = threading.Lock()
+
+    @property
+    def max_seq(self) -> int:
+        return self._max_seq
 
     def _open(self):
         path = resolve_model(self.name, self._revision, namespace="sentence-transformers")

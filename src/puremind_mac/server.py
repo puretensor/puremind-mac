@@ -27,7 +27,9 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotent
 # puremind_propose writes a file, but only into pureMind's own inbox, never into the user's notes.
 PROPOSE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
 
-Query = Annotated[str, Field(description="Keywords or a natural-language question.")]
+Query = Annotated[
+    str, Field(max_length=tools.MAX_QUERY_CHARS, description="Keywords or a natural-language question.")
+]
 Limit = Annotated[
     int, Field(ge=1, le=tools.MAX_LIMIT, description=f"Most passages to return, 1 to {tools.MAX_LIMIT}.")
 ]

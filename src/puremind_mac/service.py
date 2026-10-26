@@ -12,6 +12,8 @@ from .models import (
     Reranker,
     SentenceTransformerEmbedder,
     embedder_revision,
+    embedding_config,
+    embedding_config_label,
     model_key,
     model_label,
 )
@@ -94,6 +96,13 @@ class Service:
             raise IndexMismatch(
                 f"the index was built with {model_label(built_with)} at revision {built_rev or '(none)'} but "
                 f"revision {revision or '(none)'} is configured; run `puremind index --rebuild`"
+            )
+        built_config = self.store.get_meta("embedding_config")  # None in an index built before the window was recorded
+        config = embedding_config(self.embedder)
+        if built_with and built_config is not None and built_config != config:
+            raise IndexMismatch(
+                f"the index was built with another embedding configuration ({embedding_config_label(built_config)}, "
+                f"but {embedding_config_label(config)} is configured); run `puremind index --rebuild`"
             )
         snap = self._loaded()
         if not len(snap.index):

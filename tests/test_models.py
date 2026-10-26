@@ -494,6 +494,17 @@ def test_the_embedder_reports_the_revision_it_loads(tmp_path):
     assert models.embedder_revision(SentenceTransformerEmbedder("org/other")) == ""
 
 
+def test_embedding_config_records_the_window_without_loading_a_model():
+    a = SentenceTransformerEmbedder("org/other", max_seq=2048)
+    b = SentenceTransformerEmbedder("org/other", max_seq=1024)
+    assert a.max_seq == 2048 and b.max_seq == 1024
+    assert models.embedding_config(a) == '{"embed_max_seq": 2048}'
+    assert models.embedding_config(a) != models.embedding_config(b)
+    assert models.embedding_config(a) == models.embedding_config(
+        SentenceTransformerEmbedder("org/other", device="cpu", max_seq=2048, batch_size=1)
+    )
+
+
 def test_offline_switch_set_to_zero_does_not_block_the_download(stubs, monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     models.resolve_model(DEFAULT_EMBEDDER)
@@ -669,3 +680,11 @@ def test_overlapping_calls_during_a_failing_load_try_it_once():
         t.join(20)
     assert len(calls) == 1 and len(errors) == 8
     assert all(isinstance(e.__cause__, OSError) for e in errors)
+
+
+def test_embedding_config_label_names_the_recorded_settings():
+    from puremind_mac.models import embedding_config_label
+
+    assert embedding_config_label('{"embed_max_seq": 2048}') == "embed_max_seq 2048"
+    assert embedding_config_label('{"embed_max_seq": null}') == "embed_max_seq (unset)"
+    assert embedding_config_label(None) == embedding_config_label("not json") == "an unrecorded configuration"
