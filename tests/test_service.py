@@ -107,7 +107,9 @@ def test_search_refuses_a_changed_embedding_window(service, vault, monkeypatch):
         pytest.fail("an incompatible query reached the embedder")
 
     monkeypatch.setattr(service.embedder, "embed_query", unexpected)
-    with pytest.raises(IndexMismatch, match="embedding configuration.*rebuild"):
+    with pytest.raises(
+        IndexMismatch, match=r"embedding configuration \(embed_max_seq 2048, but embed_max_seq 1024 is configured\).*rebuild"
+    ):
         service.search("espresso", rerank=False)
 
 

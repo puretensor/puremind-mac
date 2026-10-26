@@ -680,3 +680,11 @@ def test_overlapping_calls_during_a_failing_load_try_it_once():
         t.join(20)
     assert len(calls) == 1 and len(errors) == 8
     assert all(isinstance(e.__cause__, OSError) for e in errors)
+
+
+def test_embedding_config_label_names_the_recorded_settings():
+    from puremind_mac.models import embedding_config_label
+
+    assert embedding_config_label('{"embed_max_seq": 2048}') == "embed_max_seq 2048"
+    assert embedding_config_label('{"embed_max_seq": null}') == "embed_max_seq (unset)"
+    assert embedding_config_label(None) == embedding_config_label("not json") == "an unrecorded configuration"

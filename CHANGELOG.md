@@ -10,7 +10,7 @@ A write path, through an inbox you approve.
 - A Homebrew formula in `packaging/homebrew/puremind.rb`, for use from a tap of your own (no public tap yet).
 - README: results by question type for the benchmark (Recall@5 and judged QA for each of the six LongMemEval types).
 - `puremind_search` refuses a query over 4,096 characters, in the MCP schema and in the handler, instead of tokenizing it and echoing it back.
-- The index records its embedding window (`embed_max_seq`). Changing the window is refused like a model change, until `puremind index --rebuild`, so long notes no longer keep vectors cut at the old window. An index that never recorded the window adopts the current one without a rebuild.
+- The index records its embedding window (`embed_max_seq`). Changing the window is refused like a model change, until `puremind index --rebuild`, so long notes no longer keep vectors cut at the old window. The error names the recorded and the configured window, and a model change made at the same time is reported as a model change. An index that never recorded the window adopts the current one without a rebuild. The README and the `config.toml` template say that changing `embed_max_seq` takes a rebuild.
 - An unchanged note whose mtime or size moved (an identical save, a sync tool) now has them updated without being embedded again, so `puremind_recent` orders it correctly.
 - `puremind_propose` holds a lock across the duplicate check, the 100-proposal cap and the file creation, so two agents proposing at once can no longer pass the cap or save the same proposal twice.
 - The MCP server's instructions and `puremind connect` now say that the server cannot write to the vault but accepts proposals. The test that listed exactly three tools now lists four.

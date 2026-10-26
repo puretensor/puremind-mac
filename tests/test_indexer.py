@@ -563,7 +563,9 @@ def test_a_changed_embedding_window_requires_rebuild(vault, store, embedder):
     assert '"embed_max_seq": 2048' in fingerprint
     before = embedder.texts_embedded
     embedder.max_seq = 1024
-    with pytest.raises(ModelMismatch, match="embedding configuration.*rebuild"):
+    with pytest.raises(
+        ModelMismatch, match=r"embedding configuration \(embed_max_seq 2048, but embed_max_seq 1024 is configured\).*rebuild"
+    ):
         index_vault(vault, store, embedder)
     assert store.get_meta("embedding_config") == fingerprint
     assert store.stats()["files"] == 3 and embedder.texts_embedded == before
@@ -571,6 +573,15 @@ def test_a_changed_embedding_window_requires_rebuild(vault, store, embedder):
     assert (stats.added, stats.unchanged) == (3, 0)
     assert embedder.texts_embedded == before + stats.chunks + 1  # probe before clearing
     assert index_vault(vault, store, embedder).unchanged == 3
+
+
+def test_a_new_model_with_a_new_window_is_reported_as_a_model_change(vault, store, embedder):
+    embedder.max_seq = 2048
+    index_vault(vault, store, embedder)
+    embedder.name, embedder.max_seq = "another-model", 1024
+    with pytest.raises(ModelMismatch, match="built with fake-embedder but another-model is configured; nothing was"):
+        index_vault(vault, store, embedder)
+    assert store.get_meta("embedder") == "fake-embedder" and store.stats()["files"] == 3
 
 
 def test_an_index_that_never_recorded_the_window_adopts_it(vault, store, embedder):
@@ -592,7 +603,7 @@ def test_unchanged_notes_write_their_stat_only_when_it_moved(vault, store, embed
     monkeypatch.setattr(store, "update_file_metadata", lambda *a: calls.append(a[0]) or real(*a))
     assert index_vault(vault, store, embedder).unchanged == 3
     assert calls == []
-    rel = sorted(store.file_hashes())[0]
+    rel = min(store.file_hashes())
     note = vault / rel
     os.utime(note, (note.stat().st_atime, note.stat().st_mtime + 60))
     assert index_vault(vault, store, embedder).unchanged == 3

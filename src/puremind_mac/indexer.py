@@ -22,7 +22,15 @@ from .chunker import (
     frontmatter_end,
 )
 from .chunker import VERSION as CHUNKER_VERSION
-from .models import Embedder, ModelLoadError, embedder_revision, embedding_config, model_key, model_label
+from .models import (
+    Embedder,
+    ModelLoadError,
+    embedder_revision,
+    embedding_config,
+    embedding_config_label,
+    model_key,
+    model_label,
+)
 from .store import Store, StoreError
 
 log = logging.getLogger("puremind.index")
@@ -486,22 +494,22 @@ def index_vault(
     revision = embedder_revision(embedder)
     config = embedding_config(embedder)
     known_config = store.get_meta("embedding_config")  # None in an index built before the window was recorded
-    config_changed = known_config is not None and known_config != config
-    changed = known_model is not None and (
-        model_key(known_model) != model_key(embedder.name)
-        or (known_rev is not None and known_rev != revision)
-        or config_changed
+    model_changed = known_model is not None and (
+        model_key(known_model) != model_key(embedder.name) or (known_rev is not None and known_rev != revision)
     )
+    config_changed = known_model is not None and known_config is not None and known_config != config
+    changed = model_changed or config_changed
     if changed and store.stats()["files"]:
         if not rebuild:  # else a `watch` left on the old config and a fresh `index` wipe each other in turn
-            if config_changed:
-                raise ModelMismatch(
-                    "the index was built with another embedding configuration; "
-                    "run `puremind index --rebuild`; nothing was changed"
-                )
-            built = model_label(known_model) + (f" at revision {known_rev}" if known_rev else "")
-            wanted = model_label(embedder.name) + (f" at revision {revision}" if revision else "")
-            raise ModelMismatch(f"the index was built with {built} but {wanted} is configured; nothing was changed")
+            if model_changed:  # the larger change; a new window alongside it needs the same rebuild
+                built = model_label(known_model) + (f" at revision {known_rev}" if known_rev else "")
+                wanted = model_label(embedder.name) + (f" at revision {revision}" if revision else "")
+                raise ModelMismatch(f"the index was built with {built} but {wanted} is configured; nothing was changed")
+            raise ModelMismatch(
+                f"the index was built with another embedding configuration ({embedding_config_label(known_config)}, "
+                f"but {embedding_config_label(config)} is configured); run `puremind index --rebuild`; "
+                "nothing was changed"
+            )
         _embed(embedder, [PROBE_TEXT])  # a model that cannot run must not cost the user an index
     if changed:
         log.warning(

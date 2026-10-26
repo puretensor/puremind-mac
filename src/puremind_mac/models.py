@@ -133,6 +133,17 @@ def embedding_config(embedder: object) -> str:
     return json.dumps({"embed_max_seq": getattr(embedder, "max_seq", None)}, sort_keys=True)
 
 
+def embedding_config_label(config: str | None) -> str:
+    """The settings an ``embedding_config`` fingerprint records, for messages: ``embed_max_seq 2048``."""
+    try:
+        values = json.loads(config) if config else None
+    except ValueError:
+        values = None
+    if not isinstance(values, dict) or not values:
+        return "an unrecorded configuration"
+    return ", ".join(f"{key} {'(unset)' if value is None else value}" for key, value in sorted(values.items()))
+
+
 def _offline_switch() -> str | None:
     """The Hugging Face offline variable that is set, if any."""
     for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
