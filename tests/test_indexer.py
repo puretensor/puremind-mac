@@ -1,6 +1,8 @@
 import errno
+import fcntl
 import hashlib
 import logging
+import multiprocessing
 import os
 import sqlite3
 import sys
@@ -15,13 +17,14 @@ from puremind_mac import indexer
 from puremind_mac.indexer import (
     EMBED_BATCH,
     MAX_PATH_CHARS,
+    PROBE_TEXT,
     EmbedderError,
     ModelMismatch,
     discover,
     index_vault,
     title_of,
 )
-from puremind_mac.store import Store
+from puremind_mac.store import Store, StoreError
 
 
 def test_discover_skips_hidden_dirs_and_non_markdown(vault):
@@ -49,6 +52,115 @@ def test_second_index_is_a_no_op_and_embeds_nothing(vault, store, embedder):
     stats = index_vault(vault, store, embedder)
     assert (stats.unchanged, stats.added, stats.updated) == (3, 0, 0)
     assert embedder.texts_embedded == embedded
+
+
+def _hold_index_run(vault, db, ready):
+    from fakes import FakeEmbedder
+
+    def hold(texts):
+        ready.send("embedding")
+        assert ready.recv() == "finish"
+
+    with Store(db) as writer:
+        index_vault(vault, writer, _Wrapped(FakeEmbedder(), hold, name="model-b"), rebuild=True)
+
+
+@pytest.mark.parametrize("terminate", [False, True])
+def test_index_runs_exclude_other_processes(vault, store, embedder, terminate):
+    ctx = multiprocessing.get_context("spawn")
+    ready, child = ctx.Pipe()
+    process = ctx.Process(target=_hold_index_run, args=(vault, store.path, child))
+    process.start()
+    child.close()
+    try:
+        assert ready.poll(20), "the writer never reached embedding"
+        assert ready.recv() == "embedding"
+        with pytest.raises(StoreError, match="another index run holds .*try again"):
+            index_vault(vault, store, embedder, rebuild=True)
+        assert embedder.doc_calls == 0
+        if terminate:
+            process.terminate()
+        else:
+            ready.send("finish")
+        process.join(20)
+        assert not process.is_alive()
+        if not terminate:
+            assert process.exitcode == 0
+            assert store.get_meta("embedder") == "model-b" and store.stats()["files"] == 3
+            with pytest.raises(ModelMismatch):
+                index_vault(vault, store, embedder)
+        assert index_vault(vault, store, embedder, rebuild=True).added == 3
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(20)
+        ready.close()
+        process.close()
+
+
+def test_index_lock_is_released_after_an_exception(vault, store, embedder):
+    with pytest.raises(EmbedderError):
+        index_vault(vault, store, _Wrapped(embedder, _boom))
+    assert index_vault(vault, store, embedder).added == 3
+
+
+def _lock_file(store):
+    return Path(str(Path(store.path).resolve()) + ".lock")
+
+
+def test_a_waiting_run_starts_once_the_other_run_ends(vault, store, embedder):
+    other = os.open(_lock_file(store), os.O_RDWR | os.O_CREAT, 0o600)  # another run's lock (flock is per open file)
+    timers = []
+
+    class ReleaseSoon(logging.Handler):
+        def emit(self, record):
+            if "waiting for it to finish" in record.getMessage():
+                timers.append(threading.Timer(0.3, fcntl.flock, (other, fcntl.LOCK_UN)))
+                timers[-1].start()
+
+    logger, handler = logging.getLogger("puremind.index"), ReleaseSoon()
+    logger.addHandler(handler)
+    try:
+        fcntl.flock(other, fcntl.LOCK_EX)
+        with pytest.raises(StoreError, match="another index run holds"):
+            index_vault(vault, store, embedder)
+        assert not timers and embedder.doc_calls == 0
+        start = time.monotonic()
+        assert index_vault(vault, store, embedder, wait=True).added == 3
+        assert len(timers) == 1 and time.monotonic() - start >= 0.25
+    finally:
+        logger.removeHandler(handler)
+        for timer in timers:
+            timer.join(5)
+        os.close(other)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores file permissions")
+def test_a_read_only_index_is_reported_as_such_and_gets_no_lock_file(vault, embedder, tmp_path):
+    home = tmp_path / "frozen"
+    with Store(home / "index.sqlite") as writer:
+        index_vault(vault, writer, embedder)
+        lock = _lock_file(writer)
+    lock.unlink()
+    (home / "index.sqlite").chmod(0o400)
+    home.chmod(0o500)
+    try:
+        with Store(home / "index.sqlite") as frozen:
+            assert frozen.read_only
+            with pytest.raises(StoreError, match="it is read-only"):
+                index_vault(vault, frozen, embedder)
+        assert not lock.exists()
+    finally:
+        home.chmod(0o700)
+        (home / "index.sqlite").chmod(0o600)
+
+
+def test_the_index_lock_is_never_opened_through_a_symlink(vault, store, embedder, tmp_path):
+    planted = tmp_path / "planted"
+    _lock_file(store).symlink_to(planted)
+    with pytest.raises(StoreError, match="cannot open the index lock"):
+        index_vault(vault, store, embedder)
+    assert not planted.exists() and store.stats()["files"] == 0
 
 
 def test_touching_without_changing_content_refreshes_recent_without_reembedding(vault, store, embedder, service):
@@ -691,8 +803,42 @@ def test_rebuild_repoints_an_index_at_a_moved_vault(vault, store, embedder, tmp_
     vault.rename(moved)
     with pytest.raises(ValueError, match="--rebuild"):
         index_vault(moved, store, embedder)
-    assert index_vault(moved, store, embedder, rebuild=True).updated == 3
+    assert index_vault(moved, store, embedder, rebuild=True).added == 3
     assert store.get_meta("vault_root") == str(moved.resolve())
+
+
+def test_a_failed_vault_switch_leaves_no_old_content(vault, store, embedder, tmp_path):
+    index_vault(vault, store, embedder)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "new.md").write_text("# New vault\n\nnew content\n")
+
+    def fail(texts):
+        if texts == [PROBE_TEXT]:  # the model runs; it fails later, on the new vault's notes
+            return
+        assert store.get_meta("vault_root") == str(other.resolve())
+        assert store.stats()["files"] == 0 and not store.fts_hits("tomatoes")
+        _boom(texts)
+
+    with pytest.raises(EmbedderError):
+        index_vault(other, store, _Wrapped(embedder, fail), rebuild=True)
+    assert store.get_meta("vault_root") == str(other.resolve())
+    assert store.stats() == {"files": 0, "chunks": 0, "vectors": 0}
+    assert index_vault(other, store, embedder).added == 1
+    assert set(store.file_hashes()) == {"new.md"}
+
+
+def test_a_model_that_cannot_run_does_not_cost_a_moved_vault_its_index(vault, store, embedder, tmp_path):
+    index_vault(vault, store, embedder)
+    before, root = store.stats(), store.get_meta("vault_root")
+    moved = tmp_path / "moved"
+    vault.rename(moved)
+    with pytest.raises(EmbedderError, match="could not load the model"):
+        index_vault(moved, store, _Wrapped(embedder, _boom), rebuild=True)
+    assert store.stats() == before and store.fts_hits("tomatoes")
+    assert store.get_meta("vault_root") == root  # still the old root, so a run without --rebuild is still refused
+    with pytest.raises(ValueError, match="belongs to"):
+        index_vault(moved, store, embedder)
 
 
 def test_no_probe_is_embedded_when_nothing_is_rebuilt(vault, store, embedder):
@@ -850,7 +996,7 @@ def test_a_run_purges_deleted_and_replaced_text_from_the_files(vault, private_in
     stats = index_vault(vault, private_index, embedder)
     assert (stats.removed, stats.updated) == (1, 1)
     assert _copies(home, b"zqxcanary7f3a9") == 0 and _copies(home, b"wqvcanary2b8c") == 0
-    assert (home / "index.sqlite-wal").stat().st_size == 0
+    assert not private_index.purge_pending()  # clearing the marker may itself leave metadata in the WAL
 
 
 @pytest.mark.parametrize("how", ["rebuild", "new model"])
@@ -881,7 +1027,35 @@ def test_a_reader_holding_the_log_gets_a_warning_instead_of_a_stall(vault, priva
         reader.close()
     assert stats.removed == 1 and took < 10  # the checkpoint does not wait out the 30 s lock timeout
     assert any("until the next run" in r.getMessage() for r in caplog.records)
-    assert private_index.checkpoint()  # with the reader gone, the log is emptied
+    assert private_index.purge_pending()
+    assert index_vault(vault, private_index, embedder).unchanged == 2
+    assert not private_index.purge_pending()
+
+
+@pytest.mark.parametrize("operation", ["replace_file", "delete_file"])
+def test_an_interrupted_run_leaves_cleanup_debt(vault, private_index, embedder, monkeypatch, operation):
+    note = vault / "secret.md"
+    note.write_text("# Secret\n\nzqxcanary7f3a9\n")
+    index_vault(vault, private_index, embedder)
+    if operation == "replace_file":
+        note.write_text("# Public\n\nnew content\n")
+    else:
+        note.unlink()
+    original = getattr(private_index, operation)
+
+    def interrupt(*args, **kwargs):
+        original(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(private_index, operation, interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            index_vault(vault, private_index, embedder, purge=False)
+    assert private_index.purge_pending()
+    stats = index_vault(vault, private_index, embedder)
+    assert stats.updated == stats.removed == 0
+    assert not private_index.purge_pending()
+    assert _copies(Path(private_index.path).parent, b"zqxcanary7f3a9") == 0
 
 
 def test_a_run_can_leave_the_keyword_index_compaction_to_the_next_purging_run(vault, private_index, embedder):

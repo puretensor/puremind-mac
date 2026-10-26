@@ -737,3 +737,127 @@ def test_a_deferred_purge_is_recorded_until_a_purge_or_clear(store):
     store.defer_purge()
     store.clear()
     assert not store.purge_pending()
+
+
+@pytest.mark.parametrize("operation", ["replace", "delete", "clear"])
+def test_deleted_text_debt_commits_with_the_change(store, monkeypatch, operation):
+    put(store)
+    assert not store.purge_pending()
+    monkeypatch.setattr(store, "purge", lambda: False)  # stop clear() before it pays the debt
+    if operation == "replace":
+        put(store, sha="h2", chunks=(("H", "new text"),))
+    elif operation == "delete":
+        store.delete_file("a.md")
+    else:
+        store.clear()
+    with Store(store.path) as reopened:
+        assert reopened.purge_pending()
+        assert reopened.file_hashes() == ({"a.md": "h2"} if operation == "replace" else {})
+
+
+@pytest.mark.parametrize("operation", ["replace", "delete", "clear"])
+def test_failed_deletion_rolls_back_rows_and_debt(store, monkeypatch, operation):
+    put(store)
+    store.set_meta("vault_root", "/old")
+    generation = store.generation()
+
+    def fail():
+        raise sqlite3.OperationalError("disk is full")
+
+    monkeypatch.setattr(store, "_bump", fail)
+    with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+        if operation == "replace":
+            put(store, sha="h2")
+        elif operation == "delete":
+            store.delete_file("a.md")
+        else:
+            store.clear(vault_root="/new")
+    assert store.file_hashes() == {"a.md": "h1"}
+    assert not store.purge_pending() and store.generation() == generation
+    assert store.get_meta("vault_root") == "/old"
+
+
+def test_clear_changes_the_vault_root_and_rows_atomically(store, monkeypatch):
+    put(store)
+    store.set_meta("vault_root", "/old")
+    reader = sqlite3.connect(store.path)
+    original = store._bump
+
+    def snapshot():
+        return reader.execute(
+            "SELECT (SELECT value FROM meta WHERE key = 'vault_root'), (SELECT count(*) FROM files)"
+        ).fetchone()
+
+    def observe():
+        assert snapshot() == ("/old", 1)
+        original()
+
+    monkeypatch.setattr(store, "_bump", observe)
+    try:
+        store.clear(vault_root="/new")
+        assert snapshot() == ("/new", 0)
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("failure", ["busy", "checkpoint error", "compaction error"])
+def test_purge_keeps_debt_until_compaction_and_checkpoint_succeed(store, monkeypatch, failure):
+    put(store)
+    store.delete_file("a.md")
+    execute = store.db.execute
+
+    def checkpoint():
+        assert store.purge_pending()
+        if failure == "checkpoint error":
+            raise sqlite3.OperationalError("checkpoint failed")
+        return False
+
+    def fail_compaction(sql, *args):
+        if "'optimize'" in sql:
+            raise sqlite3.OperationalError("compaction failed")
+        return execute(sql, *args)
+
+    with monkeypatch.context() as patch:
+        if failure == "compaction error":
+            patch.setattr(store.db, "execute", fail_compaction)
+        else:
+            patch.setattr(store, "checkpoint", checkpoint)
+        if failure == "busy":
+            assert not store.purge()
+        else:
+            with pytest.raises(sqlite3.OperationalError, match="failed"):
+                store.purge()
+    with Store(store.path) as reopened:
+        assert reopened.purge_pending()
+        assert reopened.purge()
+        assert not reopened.purge_pending()
+
+
+def test_clear_keeps_debt_when_its_checkpoint_is_busy(store, monkeypatch):
+    put(store)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "checkpoint", lambda: False)
+        store.clear()
+    assert not store.file_hashes() and store.purge_pending()
+    assert store.purge() and not store.purge_pending()
+
+
+@pytest.mark.parametrize("when", ["before checkpoint", "after checkpoint"])
+def test_purge_does_not_clear_a_concurrent_writers_debt(store, monkeypatch, when):
+    put(store)
+    store.defer_purge()
+    checkpoint = store.checkpoint
+    with Store(store.path) as writer:
+        def write_during_purge():
+            if when == "before checkpoint":
+                writer.delete_file("a.md")
+            assert checkpoint()
+            if when == "after checkpoint":
+                writer.delete_file("a.md")
+            return True
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "checkpoint", write_during_purge)
+            assert store.purge()
+    assert store.purge_pending()
+    assert store.purge() and not store.purge_pending()

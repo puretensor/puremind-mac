@@ -139,7 +139,8 @@ def cmd_watch(args, cfg: Config) -> int:
         purge = first[0] or (owed_since[0] is not None and now - owed_since[0] >= PURGE_AT_LEAST_EVERY)
         first[0] = False
         try:
-            stats = index_vault(vault, svc.store, svc.embedder, purge=purge)
+            # A `puremind index` still running is waited for; this run then checks the model again.
+            stats = index_vault(vault, svc.store, svc.embedder, purge=purge, wait=True)
         except (VaultMismatch, ModelMismatch) as exc:
             # A symlinked vault that now names another directory, or an index rebuilt for another
             # model since this watch read its config: every later run would fail the same way.
