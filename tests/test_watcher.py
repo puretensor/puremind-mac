@@ -585,6 +585,42 @@ def test_puremind_watch_compacts_anyway_when_the_vault_never_goes_quiet(vault, t
     assert seen == [True, False]  # the second save is past the limit, so its run compacts
 
 
+def test_puremind_watch_waits_for_an_index_run_that_holds_the_lock(vault, tmp_path, monkeypatch):
+    import fcntl
+
+    from puremind_mac import cli
+    from puremind_mac.store import Store
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("PUREMIND_HOME", str(home))
+    monkeypatch.delenv("PUREMIND_DB", raising=False)
+    _stub_models(monkeypatch)
+    assert cli.main(["index", str(vault)]) == 0
+    db, note, took = home / "index.sqlite", vault / "projects" / "garden.md", []
+    other = os.open(str(db.resolve()) + ".lock", os.O_RDWR)  # a `puremind index` still running
+    fcntl.flock(other, fcntl.LOCK_EX)
+    release = threading.Timer(0.5, fcntl.flock, (other, fcntl.LOCK_UN))
+
+    def fake_watch(vault_, run_index, delay, stop, **kw):
+        note.write_text("# Garden plan\n\nPlant zucchini in June.\n")  # saved while the other run is busy
+        start = time.monotonic()
+        release.start()
+        run_index()  # waits, where a refused first run would end the watch
+        took.append(time.monotonic() - start)
+        assert not stop.is_set()
+
+    monkeypatch.setattr("puremind_mac.watcher.watch", fake_watch)
+    try:
+        assert cli.main(["watch", str(vault)]) == 0
+    finally:
+        if release.ident is not None:
+            release.join(5)
+        os.close(other)
+    assert took and took[0] >= 0.45
+    with Store(db) as store:
+        assert [c.path for c, _ in store.fts_hits("zucchini")] == ["projects/garden.md"]
+
+
 def test_quiet_work_runs_once_after_each_quiet_spell(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()

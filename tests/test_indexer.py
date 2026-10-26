@@ -1,4 +1,5 @@
 import errno
+import fcntl
 import hashlib
 import logging
 import multiprocessing
@@ -16,6 +17,7 @@ from puremind_mac import indexer
 from puremind_mac.indexer import (
     EMBED_BATCH,
     MAX_PATH_CHARS,
+    PROBE_TEXT,
     EmbedderError,
     ModelMismatch,
     discover,
@@ -100,6 +102,65 @@ def test_index_lock_is_released_after_an_exception(vault, store, embedder):
     with pytest.raises(EmbedderError):
         index_vault(vault, store, _Wrapped(embedder, _boom))
     assert index_vault(vault, store, embedder).added == 3
+
+
+def _lock_file(store):
+    return Path(str(Path(store.path).resolve()) + ".lock")
+
+
+def test_a_waiting_run_starts_once_the_other_run_ends(vault, store, embedder):
+    other = os.open(_lock_file(store), os.O_RDWR | os.O_CREAT, 0o600)  # another run's lock (flock is per open file)
+    timers = []
+
+    class ReleaseSoon(logging.Handler):
+        def emit(self, record):
+            if "waiting for it to finish" in record.getMessage():
+                timers.append(threading.Timer(0.3, fcntl.flock, (other, fcntl.LOCK_UN)))
+                timers[-1].start()
+
+    logger, handler = logging.getLogger("puremind.index"), ReleaseSoon()
+    logger.addHandler(handler)
+    try:
+        fcntl.flock(other, fcntl.LOCK_EX)
+        with pytest.raises(StoreError, match="another index run holds"):
+            index_vault(vault, store, embedder)
+        assert not timers and embedder.doc_calls == 0
+        start = time.monotonic()
+        assert index_vault(vault, store, embedder, wait=True).added == 3
+        assert len(timers) == 1 and time.monotonic() - start >= 0.25
+    finally:
+        logger.removeHandler(handler)
+        for timer in timers:
+            timer.join(5)
+        os.close(other)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores file permissions")
+def test_a_read_only_index_is_reported_as_such_and_gets_no_lock_file(vault, embedder, tmp_path):
+    home = tmp_path / "frozen"
+    with Store(home / "index.sqlite") as writer:
+        index_vault(vault, writer, embedder)
+        lock = _lock_file(writer)
+    lock.unlink()
+    (home / "index.sqlite").chmod(0o400)
+    home.chmod(0o500)
+    try:
+        with Store(home / "index.sqlite") as frozen:
+            assert frozen.read_only
+            with pytest.raises(StoreError, match="it is read-only"):
+                index_vault(vault, frozen, embedder)
+        assert not lock.exists()
+    finally:
+        home.chmod(0o700)
+        (home / "index.sqlite").chmod(0o600)
+
+
+def test_the_index_lock_is_never_opened_through_a_symlink(vault, store, embedder, tmp_path):
+    planted = tmp_path / "planted"
+    _lock_file(store).symlink_to(planted)
+    with pytest.raises(StoreError, match="cannot open the index lock"):
+        index_vault(vault, store, embedder)
+    assert not planted.exists() and store.stats()["files"] == 0
 
 
 def test_touching_without_changing_content_refreshes_recent_without_reembedding(vault, store, embedder, service):
@@ -753,6 +814,8 @@ def test_a_failed_vault_switch_leaves_no_old_content(vault, store, embedder, tmp
     (other / "new.md").write_text("# New vault\n\nnew content\n")
 
     def fail(texts):
+        if texts == [PROBE_TEXT]:  # the model runs; it fails later, on the new vault's notes
+            return
         assert store.get_meta("vault_root") == str(other.resolve())
         assert store.stats()["files"] == 0 and not store.fts_hits("tomatoes")
         _boom(texts)
@@ -763,6 +826,19 @@ def test_a_failed_vault_switch_leaves_no_old_content(vault, store, embedder, tmp
     assert store.stats() == {"files": 0, "chunks": 0, "vectors": 0}
     assert index_vault(other, store, embedder).added == 1
     assert set(store.file_hashes()) == {"new.md"}
+
+
+def test_a_model_that_cannot_run_does_not_cost_a_moved_vault_its_index(vault, store, embedder, tmp_path):
+    index_vault(vault, store, embedder)
+    before, root = store.stats(), store.get_meta("vault_root")
+    moved = tmp_path / "moved"
+    vault.rename(moved)
+    with pytest.raises(EmbedderError, match="could not load the model"):
+        index_vault(moved, store, _Wrapped(embedder, _boom), rebuild=True)
+    assert store.stats() == before and store.fts_hits("tomatoes")
+    assert store.get_meta("vault_root") == root  # still the old root, so a run without --rebuild is still refused
+    with pytest.raises(ValueError, match="belongs to"):
+        index_vault(moved, store, embedder)
 
 
 def test_no_probe_is_embedded_when_nothing_is_rebuilt(vault, store, embedder):

@@ -456,18 +456,38 @@ def _same_directory(known: str, vault: Path) -> bool:
         return False
 
 
+def _flock(fd: int, path: str, *, block: bool) -> bool:
+    """Take the exclusive lock on ``fd``; False if another run holds it and ``block`` is off."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if block else fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError as exc:  # e.g. a file system without locks: running unlocked could interleave two runs
+        raise StoreError(f"cannot lock {path}: {_one_line(exc)}") from exc
+    return True
+
+
 @contextmanager
-def _index_lock(store: Store):
+def _index_lock(store: Store, *, wait: bool = False):
+    """Hold ``<db>.lock`` for one run. Another run is refused, or with ``wait`` waited for.
+
+    The kernel drops the lock when its holder exits, however that happens, so none is left stale.
+    """
     if store.path == ":memory:":
         yield
         return
+    store._check_writable()  # a read-only index says so, instead of failing on its lock file
     path = str(Path(store.path).resolve()) + ".lock"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise StoreError(f"another index run holds {path}; try again after it finishes") from None
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        raise StoreError(f"cannot open the index lock {path}: {_one_line(exc)}") from exc
+    try:
+        if not _flock(fd, path, block=False):
+            if not wait:
+                raise StoreError(f"another index run holds {path}; try again after it finishes")
+            log.warning("another index run holds %s; waiting for it to finish", path)
+            _flock(fd, path, block=True)
         yield
     finally:
         os.close(fd)  # keep the sidecar: unlinking it would let writers lock different inodes
@@ -481,15 +501,19 @@ def index_vault(
     *,
     should_stop: Callable[[], bool] | None = None,
     purge: bool = True,
+    wait: bool = False,
 ) -> IndexStats:
     """Bring the index in line with the vault.
 
     ``rebuild`` embeds every note again, replacing each one's rows in turn, so searches keep
     finding the old version meanwhile. A new embedding model, revision or configuration is refused
     with ``ModelMismatch`` unless ``rebuild`` is set, and then discards the index first, since
-    vectors from two models cannot be searched together. Switching vaults also discards the old
-    rows before recording the new root, in one transaction. Overlapping runs on the same database
-    are refused until this run finishes. Notes cut by an earlier chunker are cut
+    vectors from two models cannot be searched together. A vault at another path (another vault,
+    or the same one moved) is refused with ``VaultMismatch`` unless ``rebuild`` is set, and then
+    also discards the old rows, recording the new root in the same transaction. Either way the
+    model must first embed a test passage, so one that cannot run leaves the index as it was.
+    One run at a time works on a database: another run is refused with ``StoreError``, or with
+    ``wait`` waited for. Notes cut by an earlier chunker are cut
     and embedded again. ``should_stop`` is polled between notes; once it returns True the run
     ends early without removing anything.
 
@@ -499,7 +523,7 @@ def index_vault(
     put off; without it, the debt recorded with each write stays (``stats.purge_deferred``) and the
     caller pays it later, as ``puremind watch`` does.
     """
-    with _index_lock(store):
+    with _index_lock(store, wait=wait):
         return _index_vault(vault, store, embedder, rebuild, should_stop=should_stop, purge=purge)
 
 
@@ -534,8 +558,8 @@ def _index_vault(
     )
     config_changed = known_model is not None and known_config is not None and known_config != config
     changed = model_changed or config_changed
-    if changed and store.stats()["files"]:
-        if not rebuild:  # else a `watch` left on the old config and a fresh `index` wipe each other in turn
+    if (changed or root_changed) and store.stats()["files"]:  # the rows are about to be discarded
+        if changed and not rebuild:  # else a `watch` left on the old config and a fresh `index` wipe each other in turn
             if model_changed:  # the larger change; a new window alongside it needs the same rebuild
                 built = model_label(known_model) + (f" at revision {known_rev}" if known_rev else "")
                 wanted = model_label(embedder.name) + (f" at revision {revision}" if revision else "")
