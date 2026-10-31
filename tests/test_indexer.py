@@ -813,15 +813,17 @@ def test_a_failed_vault_switch_leaves_no_old_content(vault, store, embedder, tmp
     other.mkdir()
     (other / "new.md").write_text("# New vault\n\nnew content\n")
 
+    seen = []  # an assert inside the hook would only become the EmbedderError expected below
+
     def fail(texts):
         if texts == [PROBE_TEXT]:  # the model runs; it fails later, on the new vault's notes
             return
-        assert store.get_meta("vault_root") == str(other.resolve())
-        assert store.stats()["files"] == 0 and not store.fts_hits("tomatoes")
+        seen.append((store.get_meta("vault_root"), store.stats()["files"], bool(store.fts_hits("tomatoes"))))
         _boom(texts)
 
-    with pytest.raises(EmbedderError):
+    with pytest.raises(EmbedderError, match="could not load the model"):
         index_vault(other, store, _Wrapped(embedder, fail), rebuild=True)
+    assert seen and all(view == (str(other.resolve()), 0, False) for view in seen)  # emptied before any embedding
     assert store.get_meta("vault_root") == str(other.resolve())
     assert store.stats() == {"files": 0, "chunks": 0, "vectors": 0}
     assert index_vault(other, store, embedder).added == 1
@@ -855,7 +857,7 @@ def test_a_run_on_the_old_config_does_not_take_back_an_unfinished_rebuild(vault,
             _boom(texts)
 
     name = "model-b" if change == "model" else None
-    with pytest.raises(EmbedderError):
+    with pytest.raises(EmbedderError, match="could not load the model"):
         index_vault(target, store, _Wrapped(embedder, fail, name=name), rebuild=True)
     assert store.stats()["files"] == 0
     stale = ModelMismatch if change == "model" else ValueError  # a `watch` left on the old model or vault
