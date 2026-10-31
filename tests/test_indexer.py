@@ -841,6 +841,42 @@ def test_a_model_that_cannot_run_does_not_cost_a_moved_vault_its_index(vault, st
         index_vault(moved, store, embedder)
 
 
+@pytest.mark.parametrize("change", ["model", "vault"])
+def test_a_run_on_the_old_config_does_not_take_back_an_unfinished_rebuild(vault, store, embedder, tmp_path, change):
+    index_vault(vault, store, embedder)
+    target = vault
+    if change == "vault":
+        target = tmp_path / "other"
+        target.mkdir()
+        (target / "new.md").write_text("# New vault\n\nnew content\n")
+
+    def fail(texts):
+        if texts != [PROBE_TEXT]:  # the model runs, then fails on the first notes: nothing is written
+            _boom(texts)
+
+    name = "model-b" if change == "model" else None
+    with pytest.raises(EmbedderError):
+        index_vault(target, store, _Wrapped(embedder, fail, name=name), rebuild=True)
+    assert store.stats()["files"] == 0
+    stale = ModelMismatch if change == "model" else ValueError  # a `watch` left on the old model or vault
+    with pytest.raises(stale):
+        index_vault(vault, store, embedder)
+    assert store.stats()["files"] == 0
+    # the run that finishes the rebuild lifts the guard
+    finished = index_vault(target, store, _Wrapped(embedder, name=name))
+    assert finished.added == (3 if change == "model" else 1)
+    assert store.get_meta(indexer.REBUILD_PENDING) is None
+
+
+def test_an_emptied_index_with_a_finished_rebuild_still_takes_a_new_embedder(tmp_path, store, embedder):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    index_vault(empty, store, embedder)
+    index_vault(empty, store, _Wrapped(embedder, name="model-b"), rebuild=True)
+    assert store.get_meta(indexer.REBUILD_PENDING) is None
+    assert index_vault(empty, store, embedder).scanned == 0  # holds nothing to lose: no --rebuild needed
+
+
 def test_no_probe_is_embedded_when_nothing_is_rebuilt(vault, store, embedder):
     index_vault(vault, store, embedder)
     calls = embedder.doc_calls
@@ -996,7 +1032,8 @@ def test_a_run_purges_deleted_and_replaced_text_from_the_files(vault, private_in
     stats = index_vault(vault, private_index, embedder)
     assert (stats.removed, stats.updated) == (1, 1)
     assert _copies(home, b"zqxcanary7f3a9") == 0 and _copies(home, b"wqvcanary2b8c") == 0
-    assert not private_index.purge_pending()  # clearing the marker may itself leave metadata in the WAL
+    assert not private_index.purge_pending()
+    assert (home / "index.sqlite-wal").stat().st_size == 0  # an immutable read-only open needs it empty
 
 
 @pytest.mark.parametrize("how", ["rebuild", "new model"])
@@ -1056,6 +1093,18 @@ def test_an_interrupted_run_leaves_cleanup_debt(vault, private_index, embedder, 
     assert stats.updated == stats.removed == 0
     assert not private_index.purge_pending()
     assert _copies(Path(private_index.path).parent, b"zqxcanary7f3a9") == 0
+
+
+def test_a_deferring_run_that_changed_nothing_leaves_the_log_alone(vault, private_index, embedder, monkeypatch, caplog):
+    index_vault(vault, private_index, embedder)
+    (vault / "projects" / "garden.md").unlink()
+    assert index_vault(vault, private_index, embedder, purge=False).purge_deferred
+    calls = []
+    monkeypatch.setattr(private_index, "checkpoint", lambda: calls.append(1) or False)
+    with caplog.at_level(logging.WARNING):
+        stats = index_vault(vault, private_index, embedder, purge=False)
+    assert (stats.removed, stats.updated, stats.purge_deferred) == (0, 0, True)  # the earlier debt is still owed
+    assert not calls and not any("-wal" in r.getMessage() for r in caplog.records)
 
 
 def test_a_run_can_leave_the_keyword_index_compaction_to_the_next_purging_run(vault, private_index, embedder):

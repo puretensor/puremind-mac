@@ -771,7 +771,7 @@ def test_failed_deletion_rolls_back_rows_and_debt(store, monkeypatch, operation)
         elif operation == "delete":
             store.delete_file("a.md")
         else:
-            store.clear(vault_root="/new")
+            store.clear({"vault_root": "/new"})
     assert store.file_hashes() == {"a.md": "h1"}
     assert not store.purge_pending() and store.generation() == generation
     assert store.get_meta("vault_root") == "/old"
@@ -794,7 +794,7 @@ def test_clear_changes_the_vault_root_and_rows_atomically(store, monkeypatch):
 
     monkeypatch.setattr(store, "_bump", observe)
     try:
-        store.clear(vault_root="/new")
+        store.clear({"vault_root": "/new"})
         assert snapshot() == ("/new", 0)
     finally:
         reader.close()
