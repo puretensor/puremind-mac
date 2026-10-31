@@ -370,8 +370,8 @@ class Store:
 
         FTS5 only marks a deleted row's terms as deleted and drops them when it merges the parts
         of its index, so the parts are merged now; secure_delete zeroes the pages this frees.
-        Returns what ``checkpoint`` returns. Clearing the debt afterwards may leave metadata
-        in the -wal file; a concurrent write keeps the debt for the next purge.
+        Returns what the first ``checkpoint`` returns; the debt is cleared only after it succeeds,
+        and a concurrent write keeps the debt for the next purge.
         """
         self._check_writable()
         with self.db:
@@ -386,6 +386,8 @@ class Store:
                 "AND COALESCE((SELECT value FROM meta WHERE key = 'generation'), '0') = ?",
                 (str(generation),),
             )
+        # Empty the -wal again: a reader that can only open the file as immutable needs it empty.
+        self.checkpoint()
         return True
 
     def _owe_purge(self) -> None:
@@ -418,11 +420,18 @@ class Store:
     def set_meta(self, key: str, value: str) -> None:
         self._check_writable()
         with self.db:
-            self.db.execute(
-                "INSERT INTO meta(key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, value),
-            )
+            self._put_meta(key, value)
+
+    def delete_meta(self, key: str) -> None:
+        self._check_writable()
+        with self.db:
+            self.db.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+    def _put_meta(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
     def generation(self) -> int:
         """Counter bumped by every write, so long-lived readers know to reload."""
@@ -500,19 +509,16 @@ class Store:
                 self._owe_purge()
             self._bump()
 
-    def clear(self, *, vault_root: str | None = None) -> None:
-        """Remove every note and adopt ``vault_root`` in one transaction, then purge their text."""
+    def clear(self, meta: dict[str, str] | None = None) -> None:
+        """Remove every note and record ``meta`` (the new vault root and model) in one transaction,
+        then purge their text, so a crash never leaves the old identity on an emptied index."""
         self._check_writable()
         with self.db:
             self.db.execute("DELETE FROM files")
             self.db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")  # empties the keyword index outright
             self._owe_purge()
-            if vault_root is not None:
-                self.db.execute(
-                    "INSERT INTO meta(key, value) VALUES ('vault_root', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (vault_root,),
-                )
+            for key, value in (meta or {}).items():
+                self._put_meta(key, value)
             self._bump()
         if self.path != ":memory:":
             with self.db:  # no transaction is open here, which VACUUM needs

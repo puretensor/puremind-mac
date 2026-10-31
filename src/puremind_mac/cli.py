@@ -158,7 +158,10 @@ def cmd_watch(args, cfg: Config) -> int:
     def compact() -> None:
         if svc.store.purge_pending():
             svc.store.purge()
-        owed_since[0] = None
+        if not svc.store.purge_pending():
+            owed_since[0] = None
+        elif owed_since[0] is None:  # a reader kept the log from being emptied: the debt still runs
+            owed_since[0] = time.monotonic()
 
     print(f"watching {_one_line(str(vault.resolve()))} (Ctrl-C to stop)", flush=True)
     try:
