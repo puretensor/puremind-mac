@@ -11,7 +11,7 @@ import re
 import sqlite3
 import stat
 from collections.abc import Callable, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,6 +45,8 @@ EMBED_BATCH = 64  # chunks per embedder call, gathered across files
 RECHECK_ATTEMPTS = 3  # reads of one note when it keeps changing underneath the indexer
 SKIP_DIRS = {"node_modules", "__pycache__"}
 PROBE_TEXT = "pureMind embedder check"
+RUN_LOCK_SUFFIX = "-run.lock"  # not ".lock": SQLite's dot-file locking takes "<db>.lock" for itself
+REBUILD_PENDING = "rebuild_pending"  # meta key: a rebuild emptied the index for the vault and model it records
 
 
 class EmbedderError(RuntimeError):
@@ -60,6 +62,10 @@ class ModelMismatch(ValueError):
     Nothing was changed."""
 
 
+class IndexBusy(StoreError):
+    """Another index run holds the database's run lock. Nothing was changed."""
+
+
 @dataclass
 class IndexStats:
     scanned: int = 0
@@ -71,7 +77,7 @@ class IndexStats:
     skipped: list[str] = field(default_factory=list)
     removal_skipped: str = ""  # why notes missing from the scan were not removed from the index
     stopped: bool = False  # the run was asked to stop before it finished
-    purge_deferred: bool = False  # the keyword index still holds words of text this run removed
+    purge_deferred: bool = False  # a compaction is owed: the keyword index still holds words of deleted text
 
     def summary(self) -> str:
         s = (
@@ -456,6 +462,11 @@ def _same_directory(known: str, vault: Path) -> bool:
         return False
 
 
+def run_lock_path(db_path: str | os.PathLike[str]) -> str:
+    """The file whose lock an index run holds: ``<db>-run.lock``, beside the database ``db_path``."""
+    return str(Path(db_path).resolve()) + RUN_LOCK_SUFFIX
+
+
 def _flock(fd: int, path: str, *, block: bool) -> bool:
     """Take the exclusive lock on ``fd``; False if another run holds it and ``block`` is off."""
     try:
@@ -467,30 +478,48 @@ def _flock(fd: int, path: str, *, block: bool) -> bool:
     return True
 
 
-@contextmanager
-def _index_lock(store: Store, *, wait: bool = False):
-    """Hold ``<db>.lock`` for one run. Another run is refused, or with ``wait`` waited for.
+def _owned_like(fd: int, db_path: str) -> None:
+    """When running as root, give the lock file the database's owner, as SQLite does with its -wal
+    and -shm files, so that one `sudo puremind index` does not lock the owner out."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    try:
+        st = os.stat(db_path)
+        os.fchown(fd, st.st_uid, st.st_gid)
+    except OSError:  # a file system without owners: there is nothing to hand over
+        pass
 
-    The kernel drops the lock when its holder exits, however that happens, so none is left stale.
+
+@contextmanager
+def run_lock(store: Store, *, wait: bool = False):
+    """Hold the run lock of ``store``'s database (see ``run_lock_path``) for one run or compaction.
+
+    Another holder makes it raise ``IndexBusy``, or with ``wait`` it waits for that holder. The
+    kernel drops the lock when its holder exits, however that happens, so none is left stale.
     """
     if store.path == ":memory:":
         yield
         return
     store._check_writable()  # a read-only index says so, instead of failing on its lock file
-    path = str(Path(store.path).resolve()) + ".lock"
+    path = run_lock_path(store.path)
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as exc:
         raise StoreError(f"cannot open the index lock {path}: {_one_line(exc)}") from exc
     try:
+        _owned_like(fd, store.path)
         if not _flock(fd, path, block=False):
             if not wait:
-                raise StoreError(f"another index run holds {path}; try again after it finishes")
+                raise IndexBusy(f"another index run holds {path}; try again after it finishes")
             log.warning("another index run holds %s; waiting for it to finish", path)
             _flock(fd, path, block=True)
-        yield
+        try:
+            yield
+        finally:
+            with suppress(OSError):  # unlocked, not only closed: a process forked meanwhile shares the lock
+                fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        os.close(fd)  # keep the sidecar: unlinking it would let writers lock different inodes
+        os.close(fd)  # keep the file: unlinking it would let writers lock different inodes
 
 
 def index_vault(
@@ -510,9 +539,11 @@ def index_vault(
     with ``ModelMismatch`` unless ``rebuild`` is set, and then discards the index first, since
     vectors from two models cannot be searched together. A vault at another path (another vault,
     or the same one moved) is refused with ``VaultMismatch`` unless ``rebuild`` is set, and then
-    also discards the old rows, recording the new root in the same transaction. Either way the
-    model must first embed a test passage, so one that cannot run leaves the index as it was.
-    One run at a time works on a database: another run is refused with ``StoreError``, or with
+    also discards the old rows. Either way the model must first embed a test passage, so one that
+    cannot run leaves the index as it was, and the new vault and model are recorded in the
+    transaction that discards the rows. Until a run for them finishes, the emptied index stays
+    theirs: a run for the old vault or model is refused as if the rows were still there.
+    One run at a time works on a database: another run is refused with ``IndexBusy``, or with
     ``wait`` waited for. Notes cut by an earlier chunker are cut
     and embedded again. ``should_stop`` is polled between notes; once it returns True the run
     ends early without removing anything.
@@ -523,7 +554,7 @@ def index_vault(
     put off; without it, the debt recorded with each write stays (``stats.purge_deferred``) and the
     caller pays it later, as ``puremind watch`` does.
     """
-    with _index_lock(store, wait=wait):
+    with run_lock(store, wait=wait):
         return _index_vault(vault, store, embedder, rebuild, should_stop=should_stop, purge=purge)
 
 
@@ -543,11 +574,6 @@ def _index_vault(
 
     known_root = store.get_meta("vault_root")
     root_changed = known_root is not None and not _same_directory(known_root, vault)
-    if not rebuild and root_changed and store.stats()["files"]:
-        raise VaultMismatch(
-            f"this index belongs to {known_root}, not {vault}; use a different PUREMIND_DB "
-            "(or db = in config.toml) for this vault, or run `puremind index --rebuild` if the vault moved"
-        )
     known_model = store.get_meta("embedder")
     known_rev = store.get_meta("embedder_revision")  # None in an index from 0.1.1, which pinned none
     revision = embedder_revision(embedder)
@@ -558,8 +584,23 @@ def _index_vault(
     )
     config_changed = known_model is not None and known_config is not None and known_config != config
     changed = model_changed or config_changed
-    if (changed or root_changed) and store.stats()["files"]:  # the rows are about to be discarded
-        if changed and not rebuild:  # else a `watch` left on the old config and a fresh `index` wipe each other in turn
+    identity = {
+        "embedder": model_key(embedder.name),
+        "embedder_revision": revision,
+        "embedding_config": config,
+        "vault_root": str(vault),
+    }
+    if changed or root_changed:
+        has_rows = store.stats()["files"] > 0
+        # The recorded vault and model hold while the index has rows, and while a rebuild that emptied
+        # it for them is unfinished. Else a `watch` left on the old ones and a fresh `index` wipe each
+        # other in turn, or that watch takes back a switch that failed before its first note.
+        if not rebuild and (has_rows or store.get_meta(REBUILD_PENDING) is not None):
+            if root_changed:
+                raise VaultMismatch(
+                    f"this index belongs to {known_root}, not {vault}; use a different PUREMIND_DB "
+                    "(or db = in config.toml) for this vault, or run `puremind index --rebuild` if the vault moved"
+                )
             if model_changed:  # the larger change; a new window alongside it needs the same rebuild
                 built = model_label(known_model) + (f" at revision {known_rev}" if known_rev else "")
                 wanted = model_label(embedder.name) + (f" at revision {revision}" if revision else "")
@@ -569,18 +610,20 @@ def _index_vault(
                 f"but {embedding_config_label(config)} is configured); run `puremind index --rebuild`; "
                 "nothing was changed"
             )
-        _embed(embedder, [PROBE_TEXT])  # a model that cannot run must not cost the user an index
-    if changed:
-        log.warning(
-            "embedding model or configuration changed (%s%s -> %s%s); rebuilding the index",
-            known_model, f" at {known_rev}" if known_rev else "", embedder.name, f" at {revision}" if revision else "",
-        )
-    if changed or root_changed:
-        store.clear(vault_root=str(vault))
-    store.set_meta("embedder", model_key(embedder.name))
-    store.set_meta("embedder_revision", revision)
-    store.set_meta("embedding_config", config)
-    store.set_meta("vault_root", str(vault))
+        if has_rows:  # they are about to be discarded: a model that cannot run must not cost the user an index
+            _embed(embedder, [PROBE_TEXT])
+        if changed:
+            log.warning(
+                "embedding model or configuration changed (%s%s -> %s%s); rebuilding the index",
+                known_model, f" at {known_rev}" if known_rev else "", embedder.name,
+                f" at {revision}" if revision else "",
+            )
+        if root_changed:
+            log.warning("vault directory changed (%s -> %s); rebuilding the index", known_root, vault)
+        store.clear(meta={**identity, REBUILD_PENDING: "1"})
+    else:
+        for key, value in identity.items():
+            store.set_meta(key, value)
 
     scan = _scan(vault)
     stats.skipped.extend(scan.skipped)
@@ -607,16 +650,19 @@ def _index_vault(
         for rel in gone:
             store.delete_file(rel)
             stats.removed += 1
+        if not scan.errors and store.get_meta(REBUILD_PENDING) is not None:
+            store.delete_meta(REBUILD_PENDING)  # the rebuild finished
     emptied = True
     if store.purge_pending():
         if purge:
             emptied = store.purge()
         else:
-            emptied = store.defer_purge()
-            stats.purge_deferred = True
+            stats.purge_deferred = True  # the debt is recorded in the index; the caller pays it later
+            if stats.removed or stats.updated:  # but text this run deleted leaves the -wal file now
+                emptied = store.checkpoint()
     if not emptied:
         log.warning(
-            "another process was reading the index, so text deleted or replaced in this run stays in "
+            "another process was using the index, so text deleted or replaced stays in "
             "%s-wal until the next run", store.path,
         )
     return stats
