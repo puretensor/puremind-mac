@@ -391,17 +391,10 @@ class Store:
         return True
 
     def _owe_purge(self) -> None:
+        """Record, in the caller's transaction, that deleted text awaits ``purge``. The record
+        commits with the deletion, so a process that stops before paying it (a crash, a power cut)
+        leaves the debt to the next one."""
         self.db.execute("INSERT INTO meta(key, value) VALUES ('purge_pending', '1') ON CONFLICT(key) DO NOTHING")
-
-    def defer_purge(self) -> bool:
-        """Note in the index that ``purge`` is still owed, so that a process that stops before
-        paying it (a crash, a power cut) leaves the debt to the next one, and empty the -wal file.
-        The deleted chunks' text is already gone from the tables; only the keyword index still
-        holds their words. Returns what ``checkpoint`` returns."""
-        self._check_writable()
-        with self.db:
-            self._owe_purge()
-        return self.checkpoint()
 
     def purge_pending(self) -> bool:
         return self.get_meta("purge_pending") is not None

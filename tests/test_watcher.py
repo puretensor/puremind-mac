@@ -540,7 +540,7 @@ def test_puremind_watch_compacts_on_its_first_run_when_quiet_and_on_exit(vault, 
     _stub_models(monkeypatch)
     assert cli.main(["index", str(vault)]) == 0
     store = Store(home / "index.sqlite")
-    store.defer_purge()  # what a watch that crashed leaves behind
+    store.delete_file("projects/garden.md")  # a watch that crashed after this left the purge owed
     store.close()
     db, note, seen = home / "index.sqlite", vault / "projects" / "garden.md", []
 

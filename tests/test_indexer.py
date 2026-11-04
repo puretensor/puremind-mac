@@ -168,6 +168,26 @@ def test_a_process_forked_during_a_run_does_not_keep_its_lock(vault, store, embe
             os.waitpid(pid, 0)
 
 
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="only root can give a file away")
+def test_a_run_as_root_gives_away_only_a_lock_file_it_made(vault, embedder, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "index.sqlite"
+    Store(db).close()
+    os.chown(db, 65534, 65534)  # the user's index, run as root (`sudo puremind index` keeps HOME on macOS)
+    lock = Path(indexer.run_lock_path(db))
+    with Store(db) as store:
+        index_vault(vault, store, embedder)
+    assert lock.stat().st_uid == 65534  # so the user's own runs can still open it
+    lock.unlink()
+    secret = tmp_path / "secret"
+    secret.write_text("root's own file\n")
+    os.link(secret, lock)  # the index's owner can plant a hard link where no protected_hardlinks stops it
+    with Store(db) as store:
+        index_vault(vault, store, embedder)
+    assert secret.stat().st_uid == 0
+
+
 @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores file permissions")
 @pytest.mark.parametrize("frozen_dir", [True, False])
 def test_a_read_only_index_is_reported_as_such_and_gets_no_lock_file(vault, embedder, tmp_path, frozen_dir):
@@ -904,6 +924,24 @@ def test_a_failed_switch_is_not_taken_back_by_a_run_for_the_old_vault_or_model(
     assert index_vault(new_vault, store, new_model).added == (1 if switch == "vault" else 3)
     with pytest.raises(refused):  # now its notes keep the old ones out, as before
         index_vault(vault, store, embedder)
+
+
+def test_a_switch_that_could_read_none_of_the_new_notes_is_not_finished(vault, store, embedder, tmp_path, monkeypatch):
+    index_vault(vault, store, embedder)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "new.md").write_text("# New vault\n\nnew content\n")
+
+    def unreadable(path):
+        raise PermissionError(errno.EACCES, "Permission denied", str(path))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(indexer, "_read_note", unreadable)
+        stats = index_vault(other, store, embedder, rebuild=True)  # the listing works, the notes do not
+    assert stats.skipped and store.stats()["files"] == 0
+    with pytest.raises(VaultMismatch):  # still the new vault's, though no note of it is indexed yet
+        index_vault(vault, store, embedder)
+    assert index_vault(other, store, embedder).added == 1
 
 
 def test_no_probe_is_embedded_when_nothing_is_rebuilt(vault, store, embedder):

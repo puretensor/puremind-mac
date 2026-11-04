@@ -478,16 +478,25 @@ def _flock(fd: int, path: str, *, block: bool) -> bool:
     return True
 
 
-def _owned_like(fd: int, db_path: str) -> None:
-    """When running as root, give the lock file the database's owner, as SQLite does with its -wal
-    and -shm files, so that one `sudo puremind index` does not lock the owner out."""
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        return
+def _open_lock_file(path: str, db_path: str) -> int:
+    """Open the run lock file ``path``, never through a symlink.
+
+    When running as root, a lock file made here is given the database's owner, as SQLite does
+    with its -wal and -shm files, so that one `sudo puremind index` does not lock the owner out.
+    A file that is already there is never given away: it could be a hard link to another file.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        st = os.stat(db_path)
-        os.fchown(fd, st.st_uid, st.st_gid)
-    except OSError:  # a file system without owners: there is nothing to hand over
-        pass
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR | nofollow, 0o600)
+    except FileExistsError:  # also a symlink, which the open below then refuses
+        return os.open(path, os.O_RDWR | nofollow)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            st = os.stat(db_path)
+            os.fchown(fd, st.st_uid, st.st_gid)
+        except OSError:  # a file system without owners: there is nothing to hand over
+            pass
+    return fd
 
 
 @contextmanager
@@ -503,11 +512,10 @@ def run_lock(store: Store, *, wait: bool = False):
     store._check_writable()  # a read-only index says so, instead of failing on its lock file
     path = run_lock_path(store.path)
     try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = _open_lock_file(path, store.path)
     except OSError as exc:
         raise StoreError(f"cannot open the index lock {path}: {_one_line(exc)}") from exc
     try:
-        _owned_like(fd, store.path)
         if not _flock(fd, path, block=False):
             if not wait:
                 raise IndexBusy(f"another index run holds {path}; try again after it finishes")
@@ -650,8 +658,14 @@ def _index_vault(
         for rel in gone:
             store.delete_file(rel)
             stats.removed += 1
-        if not scan.errors and store.get_meta(REBUILD_PENDING) is not None:
-            store.delete_meta(REBUILD_PENDING)  # the rebuild finished
+        # The rebuild finished: from now on the notes it indexed hold the index for their vault and
+        # model. Not if it indexed none of a vault's notes (none could be read): it failed instead.
+        if (
+            store.get_meta(REBUILD_PENDING) is not None
+            and not scan.errors
+            and (not scan.paths or store.stats()["files"])
+        ):
+            store.delete_meta(REBUILD_PENDING)
     emptied = True
     if store.purge_pending():
         if purge:
