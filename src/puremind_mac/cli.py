@@ -123,7 +123,7 @@ PURGE_AT_LEAST_EVERY = 300.0
 
 
 def cmd_watch(args, cfg: Config) -> int:
-    from .indexer import ModelMismatch, VaultMismatch, index_vault
+    from .indexer import IndexBusy, ModelMismatch, VaultMismatch, index_vault, run_lock
     from .watcher import watch
 
     vault = _vault(cfg, args.vault_dir)
@@ -157,7 +157,12 @@ def cmd_watch(args, cfg: Config) -> int:
 
     def compact() -> None:
         if svc.store.purge_pending():
-            svc.store.purge()
+            try:
+                with run_lock(svc.store):  # not beside another process's run, which pays the debt or keeps it
+                    if not svc.store.purge():
+                        return  # a reader kept the -wal file: still owed
+            except IndexBusy:
+                return
         owed_since[0] = None
 
     print(f"watching {_one_line(str(vault.resolve()))} (Ctrl-C to stop)", flush=True)
@@ -167,7 +172,7 @@ def cmd_watch(args, cfg: Config) -> int:
         try:
             compact()  # skipped by a crash or power cut: the record in the index carries it to the next run
         except Exception as exc:  # noqa: BLE001 - must not hide why watching ended
-            print(f"warning: the keyword index was not compacted ({_one_line(exc)}); the next run does it",
+            print(f"warning: the keyword index was not compacted ({_one_line(str(exc))}); the next run does it",
                   file=sys.stderr)
         finally:
             svc.store.close()
