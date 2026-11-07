@@ -726,15 +726,14 @@ def test_vectors_of_different_lengths_are_refused(store):
         store.load_index()
 
 
-def test_a_deferred_purge_is_recorded_until_a_purge_or_clear(store):
-    store.replace_file("a.md", "h", 0.0, 1, "A", [("", "alpha")], np.ones((1, 4), dtype=np.float32))
-    assert not store.purge_pending()
-    store.defer_purge()
-    store.defer_purge()
+def test_deleted_text_is_owed_until_a_purge_or_clear(store):
+    put(store)
+    put(store, path="b.md")
+    assert not store.purge_pending()  # adding text owes nothing
+    store.delete_file("a.md")
     assert store.purge_pending()
-    store.purge()
-    assert not store.purge_pending()
-    store.defer_purge()
+    assert store.purge() and not store.purge_pending()
+    store.delete_file("b.md")
     store.clear()
     assert not store.purge_pending()
 
@@ -845,7 +844,8 @@ def test_clear_keeps_debt_when_its_checkpoint_is_busy(store, monkeypatch):
 @pytest.mark.parametrize("when", ["before checkpoint", "after checkpoint"])
 def test_purge_does_not_clear_a_concurrent_writers_debt(store, monkeypatch, when):
     put(store)
-    store.defer_purge()
+    put(store, path="b.md")
+    store.delete_file("b.md")  # owes a purge
     checkpoint = store.checkpoint
     with Store(store.path) as writer:
         def write_during_purge():
