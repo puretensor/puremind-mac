@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 (2026-11-07)
+
+- Only change ownership of newly created index lock files, preserve failed vault switches, and remove the unused deferred-purge API.
+
 ## 0.2.0 (unreleased)
 
 A write path, through an inbox you approve.
