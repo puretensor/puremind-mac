@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
@@ -370,8 +370,8 @@ class Store:
 
         FTS5 only marks a deleted row's terms as deleted and drops them when it merges the parts
         of its index, so the parts are merged now; secure_delete zeroes the pages this frees.
-        Returns what the first ``checkpoint`` returns; the debt is cleared only after it succeeds,
-        and a concurrent write keeps the debt for the next purge.
+        Returns what ``checkpoint`` returns. The debt stays recorded until that checkpoint has
+        succeeded, and a concurrent write keeps it for the next purge.
         """
         self._check_writable()
         with self.db:
@@ -381,27 +381,20 @@ class Store:
             return False
         with self.db:
             # A writer after compaction owes another purge, even if the checkpoint included its pages.
-            self.db.execute(
+            paid = self.db.execute(
                 "DELETE FROM meta WHERE key = 'purge_pending' "
                 "AND COALESCE((SELECT value FROM meta WHERE key = 'generation'), '0') = ?",
                 (str(generation),),
-            )
-        # Empty the -wal again: a reader that can only open the file as immutable needs it empty.
-        self.checkpoint()
+            ).rowcount
+        if paid:
+            self.checkpoint()  # that change leaves the -wal file too; a reader arriving meanwhile only delays it
         return True
 
     def _owe_purge(self) -> None:
+        """Record, in the caller's transaction, that deleted text awaits ``purge``. The record
+        commits with the deletion, so a process that stops before paying it (a crash, a power cut)
+        leaves the debt to the next one."""
         self.db.execute("INSERT INTO meta(key, value) VALUES ('purge_pending', '1') ON CONFLICT(key) DO NOTHING")
-
-    def defer_purge(self) -> bool:
-        """Note in the index that ``purge`` is still owed, so that a process that stops before
-        paying it (a crash, a power cut) leaves the debt to the next one, and empty the -wal file.
-        The deleted chunks' text is already gone from the tables; only the keyword index still
-        holds their words. Returns what ``checkpoint`` returns."""
-        self._check_writable()
-        with self.db:
-            self._owe_purge()
-        return self.checkpoint()
 
     def purge_pending(self) -> bool:
         return self.get_meta("purge_pending") is not None
@@ -428,8 +421,10 @@ class Store:
             self.db.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     def _put_meta(self, key: str, value: str) -> None:
+        """Set ``key`` within the transaction the caller has open."""
         self.db.execute(
-            "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
 
@@ -475,8 +470,7 @@ class Store:
         if chunks and (vectors is None or len(vectors) != len(chunks)):
             raise ValueError("vectors must have one row per chunk")
         with self.db:
-            if self.db.execute("DELETE FROM files WHERE path = ?", (path,)).rowcount:
-                self._owe_purge()
+            self._drop_file(path)
             self.db.execute(
                 "INSERT INTO files(path, sha256, mtime, size, title, indexed_at, chunker) VALUES (?,?,?,?,?,?,?)",
                 (path, sha256, mtime, size, title, time.time(), chunker),
@@ -505,13 +499,16 @@ class Store:
     def delete_file(self, path: str) -> None:
         self._check_writable()
         with self.db:
-            if self.db.execute("DELETE FROM files WHERE path = ?", (path,)).rowcount:
-                self._owe_purge()
+            self._drop_file(path)
             self._bump()
 
-    def clear(self, meta: dict[str, str] | None = None) -> None:
-        """Remove every note and record ``meta`` (the new vault root and model) in one transaction,
-        then purge their text, so a crash never leaves the old identity on an emptied index."""
+    def _drop_file(self, path: str) -> None:
+        """Delete ``path``'s rows within the caller's transaction, owing a purge if it had any."""
+        if self.db.execute("DELETE FROM files WHERE path = ?", (path,)).rowcount:
+            self._owe_purge()
+
+    def clear(self, *, meta: Mapping[str, str] | None = None) -> None:
+        """Remove every note and set ``meta`` in one transaction, then purge their text."""
         self._check_writable()
         with self.db:
             self.db.execute("DELETE FROM files")

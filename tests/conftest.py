@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import site
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ if not TESTING_INSTALLED:
 from fakes import FakeEmbedder, FakeReranker
 
 from puremind_mac.config import Config
+from puremind_mac.indexer import run_lock_path
 from puremind_mac.service import Service
 from puremind_mac.store import Store
 
@@ -94,3 +97,35 @@ def _hermetic_environment(monkeypatch, tmp_path_factory):
 def testing_installed() -> bool:
     """True when the suite runs against an installed package (PUREMIND_TEST_INSTALLED=1)."""
     return TESTING_INSTALLED
+
+
+class HeldRunLock:
+    """A database's run lock, held on a descriptor of its own as another process's index run holds it."""
+
+    def __init__(self, db_path):
+        self.fd = os.open(run_lock_path(db_path), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        self.timer: threading.Timer | None = None
+
+    def release_in(self, seconds: float) -> None:
+        self.timer = threading.Timer(seconds, fcntl.flock, (self.fd, fcntl.LOCK_UN))
+        self.timer.start()
+
+    def close(self) -> None:
+        if self.timer is not None:
+            self.timer.join(5)  # before the descriptor is closed, so a late unlock cannot reach a reused one
+        os.close(self.fd)
+
+
+@pytest.fixture
+def another_run():
+    """``another_run(db_path)`` holds that database's run lock until the test ends, or until ``release_in``."""
+    held: list[HeldRunLock] = []
+
+    def hold(db_path) -> HeldRunLock:
+        held.append(HeldRunLock(db_path))
+        return held[-1]
+
+    yield hold
+    for lock in held:
+        lock.close()

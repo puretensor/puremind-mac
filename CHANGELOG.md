@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 (2026-11-07)
+
+- Only change ownership of newly created index lock files, preserve failed vault switches, and remove the unused deferred-purge API.
+
 ## 0.2.0 (unreleased)
 
 A write path, through an inbox you approve.
@@ -14,11 +18,10 @@ A write path, through an inbox you approve.
 - An unchanged note whose mtime or size moved (an identical save, a sync tool) now has them updated without being embedded again, so `puremind_recent` orders it correctly.
 - `puremind_propose` holds a lock across the duplicate check, the 100-proposal cap and the file creation, so two agents proposing at once can no longer pass the cap or save the same proposal twice.
 - The MCP server's instructions and `puremind connect` now say that the server cannot write to the vault but accepts proposals. The test that listed exactly three tools now lists four.
-- Index runs hold a process lock beside the database until they finish. A `puremind index` that overlaps another run is refused with a clear message, and a `puremind watch` run waits for the other run to finish and then checks the model again, so a watch on an old model can no longer write its vectors into an index rebuilt for another model. A read-only index is still reported as read-only, and the lock file is never opened through a symlink.
-- Rebuilding for another vault, or for a vault that moved, first has the model embed a test passage, so a model that cannot run leaves the index as it was. It then clears the old rows and records the new root in one transaction before indexing the notes. If embedding fails after that, searches no longer return the old vault's text labelled as the new vault; results stay empty until new notes are indexed.
-- A rebuild for another model or vault records the new model, root and an unfinished-rebuild marker in the transaction that empties the index; only a run that visits every note removes the marker. A rebuild that fails or is cut short before writing a note therefore can no longer be taken back by a `puremind watch` still on the old model or vault, which used to treat the empty index as free to claim. An index that is empty for any other reason still takes a new model without `--rebuild`.
-- A successful compaction leaves the -wal file empty again, and a `puremind watch` run that changed nothing no longer checkpoints or warns about text in the -wal file just because an earlier compaction is still owed. A compaction that a reader kept from finishing keeps `puremind watch` counting towards the next one.
-- Replacing or deleting a note records the cleanup owed in the same transaction. A run that crashes leaves that record for the next run, and compaction keeps it until the WAL checkpoint succeeds, including when a reader holds the log open.
+- Index runs hold a lock on a file beside the database, `index.sqlite-run.lock` (not `index.sqlite.lock`, which SQLite's own dot-file locking uses), until they finish. A `puremind index` that overlaps another run is refused with a clear message, and a `puremind watch` run waits for the other run to finish and then checks the model again, so a watch on an old model can no longer write its vectors into an index rebuilt for another model. While another run holds the lock, `puremind watch` leaves compacting the keyword index to it, so Ctrl-C on a waiting watch ends it at once. A read-only index is still reported as read-only, the lock file is never opened through a symlink, a lock file a run as root creates is given to the database's owner (one already there never is, so a planted hard link gains nothing), and a process forked during a run does not keep the lock.
+- Rebuilding for another vault, or for a vault that moved, first has the model embed a test passage, so a model that cannot run leaves the index as it was. It then clears the old rows and records the new root and model in one transaction before indexing the notes, and logs that it is rebuilding. If embedding fails after that, searches no longer return the old vault's text labelled as the new vault; results stay empty until new notes are indexed, and meanwhile a run for the old vault or model (a `puremind watch` left running, say) is refused instead of taking the index back.
+- Replacing or deleting a note records the cleanup owed in the same transaction. A run that crashes leaves that record for the next run, and compaction keeps it until the WAL checkpoint succeeds, including when a reader holds the log open, and then leaves the -wal file empty. A `puremind watch` run that deletes nothing no longer waits for readers or warns about the -wal file.
+- `puremind watch` prints a warning, instead of crashing with a TypeError, when compacting the keyword index fails as it stops, so the error that stopped it is no longer hidden either.
 
 ## 0.1.6 (2026-10-22)
 
