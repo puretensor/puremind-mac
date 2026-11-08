@@ -206,7 +206,7 @@ To run the retrieval benchmark yourself, see `bench/README.md`.
 
 ## Roadmap
 
-- **v0.2 (done, unreleased):** a write path through a human-approved inbox, and a Homebrew formula in `packaging/homebrew/`.
+- **v0.2 (released 2026-11-08 as 0.2.1):** a write path through a human-approved inbox, and a Homebrew formula in `packaging/homebrew/`.
 - **v0.3:** a menu-bar app that runs the watcher and server, with first-run setup for the supported agents.
 
 ## Development
