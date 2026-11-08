@@ -8,8 +8,8 @@ class Puremind < Formula
 
   desc "Local Markdown memory for AI coding agents, served over MCP"
   homepage "https://github.com/puretensor/puremind-mac"
-  url "https://github.com/puretensor/puremind-mac/archive/refs/tags/v0.1.5.tar.gz"
-  sha256 "2515a2acb7fea942049157b99371daec9612a14ea84b3d381bd845b64801539c"
+  url "https://github.com/puretensor/puremind-mac/archive/refs/tags/v0.2.1.tar.gz"
+  sha256 "525aa86a49268e7b73fad3954acfcd95b39f1a2926145aaf1b88a7e77406bef9"
   license "Apache-2.0"
   head "https://github.com/puretensor/puremind-mac.git", branch: "main"
 
