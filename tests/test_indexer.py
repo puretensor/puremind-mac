@@ -1191,3 +1191,15 @@ def test_a_run_can_leave_the_keyword_index_compaction_to_the_next_purging_run(va
     stats = index_vault(vault, private_index, embedder)  # nothing changed, but the compaction is owed
     assert (stats.removed, stats.updated, stats.purge_deferred) == (0, 0, False)
     assert not private_index.purge_pending() and _copies(home, b"zqxcanary7f3a9") == 0
+
+
+def test_a_deferring_run_that_changed_nothing_leaves_the_log_alone(vault, private_index, embedder, monkeypatch, caplog):
+    index_vault(vault, private_index, embedder)
+    (vault / "projects" / "garden.md").unlink()
+    assert index_vault(vault, private_index, embedder, purge=False).purge_deferred
+    calls = []
+    monkeypatch.setattr(private_index, "checkpoint", lambda: calls.append(1) or False)
+    with caplog.at_level(logging.WARNING):
+        stats = index_vault(vault, private_index, embedder, purge=False)
+    assert (stats.removed, stats.updated, stats.purge_deferred) == (0, 0, True)  # the earlier debt is still owed
+    assert not calls and not any("-wal" in r.getMessage() for r in caplog.records)
